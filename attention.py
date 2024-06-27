@@ -162,7 +162,7 @@ class Attention(nn.Module):
 
             # if softmax activation, masking is handled by adding -inf before softmax
             if attn_mask is not None:
-                attn_mask_ = torch.zeros(qseqlen, kseqlen, dtype=xq.dtype).masked_fill(attn_mask.logical_not(), float('-inf'))
+                attn_mask_ = torch.zeros(qseqlen, kseqlen, dtype=xq.dtype, device=xq.device).masked_fill(attn_mask.logical_not(), float('-inf'))
                 scores = scores + attn_mask_
 
             # apply softmax activation to inner products
