@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformer_blocks import EncoderBlock
+from transformer_blocks import EncoderBlock, create_norm
 from attention_utils import precompute_freqs_cis
 
 class TransformerLM(nn.Module):
@@ -16,8 +16,10 @@ class TransformerLM(nn.Module):
         activation: str,
         norm_first: bool,
         max_block_size: int,
+        norm_type: str = 'layernorm',
         bias: bool = True,
-        pos_enc_type: str = 'pos_emb'
+        pos_enc_type: str = 'pos_emb',
+        use_flash_attention=True,
         ):
         """
         Transformer autoregressive language model.
@@ -60,15 +62,19 @@ class TransformerLM(nn.Module):
         self.activation = activation
         self.norm_first = norm_first
         self.block_size = max_block_size
+        self.norm_type = norm_type
         self.bias = bias
         self.pos_enc_type = pos_enc_type
+        self.use_flash_attention = use_flash_attention
+        self._need_weights = not use_flash_attention # used to specify whether flash attention is used
 
         layers = dict(
             token_embedder = nn.Embedding(vocab_size, d_model),
             dropout = nn.Dropout(dropout_rate),
             blocks = nn.ModuleList([EncoderBlock(d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate,
-                activation=activation, norm_first=norm_first, bias=bias, causal=True) for _ in range(n_layers)]),
-            final_out = nn.Linear(d_model, vocab_size)
+                activation=activation, norm_first=norm_first, norm_type=norm_type, bias=bias, causal=True) for _ in range(n_layers)]),
+            norm = create_norm(d_model, self.norm_type),
+            final_out = nn.Linear(d_model, vocab_size, bias=False)
             )
 
         if pos_enc_type == 'pos_emb':
@@ -86,7 +92,27 @@ class TransformerLM(nn.Module):
         self.layers = nn.ModuleDict(layers)
 
         # weight-tying embedder and final layer
-        self.layers.token_embedder.weights = self.layers.final_out
+        self.layers.token_embedder.weight = self.layers.final_out.weight
+
+        # initialize weights
+        self.apply(self._init_weights)
+        # NOTE: previously, I did not apply special initialization, but it turns out that it is important
+
+        # TODO: decide whether to keep this
+        # mlp_special_init_layer = 'linear3' if activation == 'swiglu' else 'linear2'
+        # for pn, p in self.named_parameters():
+        #     # apply special n_layer-scaled initialization to output projection of attention and last layer of mlp
+        #     if pn.endswith(f'{mlp_special_init_layer}.weight') or pn.endswith('wo.weight'):
+        #         torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 
     def forward(self, x, targets=None):
         device = x.device
@@ -107,17 +133,19 @@ class TransformerLM(nn.Module):
             freqs_sin = self.freqs_sin[:t]
 
         for enc_block in self.layers.blocks:
-            x = enc_block(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin)
+            x = enc_block(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=self._need_weights)
 
+        x = self.layers.norm(x)
+
+        logits = self.layers.final_out(x)
+
+        loss = None
         if targets is not None:
             # compute loss if given targets
-            logits = self.layers.final_out(x)
             loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.contiguous().view(-1), ignore_index=-1)
-        else:
-            logits = self.layers.final_out(x[:, [-1], :])
-            loss = None
 
         return logits, loss
+
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
