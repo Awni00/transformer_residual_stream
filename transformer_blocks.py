@@ -61,19 +61,19 @@ class EncoderBlock(nn.Module):
         self.norm2 = create_norm(self.d_model, self.norm_type)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
-    def forward(self, x, freqs_cos=None, freqs_sin=None):
+    def forward(self, x, freqs_cos=None, freqs_sin=None, need_weights=False):
         if self.norm_first:
-            x = x + self._compute_self_attn(self.norm1(x), freqs_cos=freqs_cos, freqs_sin=freqs_sin)
+            x = x + self._compute_self_attn(self.norm1(x), freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=need_weights)
             x = x + self._apply_ff_block(self.norm2(x))
         else:
-            x = self.norm1(x + self._compute_self_attn(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin))
+            x = self.norm1(x + self._compute_self_attn(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=need_weights))
             x = self.dropout(x)
             x = self.norm2(x + self._apply_ff_block(x))
         return x
 
-    def _compute_self_attn(self, x, freqs_cos=None, freqs_sin=None):
+    def _compute_self_attn(self, x, freqs_cos=None, freqs_sin=None, need_weights=False):
         x, _ = self.self_attn(query=x, key=x, value=x, is_causal=self.causal,
-            need_weights=False, attn_mask=None, freqs_cos=freqs_cos, freqs_sin=freqs_sin)
+            need_weights=need_weights, attn_mask=None, freqs_cos=freqs_cos, freqs_sin=freqs_sin)
         x = self.dropout(x)
         return x
 
