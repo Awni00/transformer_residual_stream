@@ -8,7 +8,7 @@ def get_activation_function(name):
         'relu': nn.ReLU(),
         'sigmoid': nn.Sigmoid(),
         'tanh': nn.Tanh(),
-        'gelu': nn.GELU(),
+        'gelu': nn.GELU(approximate='tanh'),
         'silu': nn.SiLU(),
         'softmax': nn.Softmax(dim=-1),
         'identity': nn.Identity(),
