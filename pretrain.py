@@ -61,10 +61,10 @@ parser.add_argument('--n_heads', type=int, default=16, help='Number of attention
 parser.add_argument('--dff', type=int, default=None, help='Dimensionality of the feed-forward layer')
 parser.add_argument('--activation', type=str, default='swiglu', help='Activation function')
 parser.add_argument('--dropout_rate', type=float, default=0.0, help='Dropout rate')
-parser.add_argument('--norm_first', type=int, help='Whether to apply layer normalization before the attention layer')
+parser.add_argument('--norm_first', type=int, default=1, help='Whether to apply layer normalization before the attention layer')
 parser.add_argument('--norm_type', type=str, default='rmsnorm', help='Type of normalization')
 parser.add_argument('--max_block_size', type=int, default=1024, help='Maximum block size')
-parser.add_argument('--bias', type=int, help='Whether to include bias in the model')
+parser.add_argument('--bias', type=int, default=0, help='Whether to include bias in the model')
 parser.add_argument('--pos_enc_type', type=str, default='RoPE', help='Type of positional encoding')
 
 parser.add_argument('--seed', type=int, default=None, help='Random seed')
