@@ -17,6 +17,7 @@ class TransformerLM(nn.Module):
         activation: str,
         norm_first: bool,
         max_block_size: int,
+        resgate_kwargs: dict = None,
         norm_type: str = 'layernorm',
         bias: bool = True,
         pos_enc_type: str = 'pos_emb',
@@ -66,6 +67,7 @@ class TransformerLM(nn.Module):
         self.norm_type = norm_type
         self.bias = bias
         self.pos_enc_type = pos_enc_type
+        self.resgate_kwargs = resgate_kwargs
         self.use_flash_attention = use_flash_attention
         self._need_weights = not use_flash_attention # used to specify whether flash attention is used
 
@@ -73,7 +75,7 @@ class TransformerLM(nn.Module):
             token_embedder = nn.Embedding(vocab_size, d_model),
             dropout = nn.Dropout(dropout_rate),
             blocks = nn.ModuleList([EncoderBlock(
-                d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate,
+                d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate, resgate_kwargs=resgate_kwargs,
                 activation=activation, norm_first=norm_first, norm_type=norm_type, bias=bias, causal=True) for _ in range(n_layers)]),
             norm = create_norm(d_model, self.norm_type),
             final_out = nn.Linear(d_model, vocab_size, bias=False)
