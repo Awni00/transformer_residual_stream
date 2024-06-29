@@ -59,13 +59,17 @@ parser.add_argument('--d_model', type=int, default=1024, help='Dimensionality of
 parser.add_argument('--n_layers', type=int, default=24, help='Number of layers in the model')
 parser.add_argument('--n_heads', type=int, default=16, help='Number of attention heads')
 parser.add_argument('--dff', type=int, default=None, help='Dimensionality of the feed-forward layer')
-parser.add_argument('--activation', type=str, default='swiglu', help='Activation function')
+parser.add_argument('--activation', type=str, default='gelu', help='Activation function')
 parser.add_argument('--dropout_rate', type=float, default=0.0, help='Dropout rate')
 parser.add_argument('--norm_first', type=int, default=1, help='Whether to apply layer normalization before the attention layer')
-parser.add_argument('--norm_type', type=str, default='rmsnorm', help='Type of normalization')
+parser.add_argument('--norm_type', type=str, default='layernorm', help='Type of normalization')
 parser.add_argument('--max_block_size', type=int, default=1024, help='Maximum block size')
 parser.add_argument('--bias', type=int, default=0, help='Whether to include bias in the model')
 parser.add_argument('--pos_enc_type', type=str, default='RoPE', help='Type of positional encoding')
+
+parser.add_argument('--gate_application', type=str, default='none', help='Ways of applying gate')
+parser.add_argument('--gate_compute', type=str, default='linear-bias', help='Ways of computing gates')
+parser.add_argument('--gate_activation', type=str, default='sigmoid', help='Type of positional encoding')
 
 parser.add_argument('--seed', type=int, default=None, help='Random seed')
 
@@ -120,7 +124,12 @@ norm_type = args.norm_type
 max_block_size = args.max_block_size
 bias = bool(args.bias)
 pos_enc_type = args.pos_enc_type
-model_config = dict(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dff=dff, activation=activation,
+gate_application = args.gate_application
+gate_compute = args.gate_compute
+gate_activation = args.gate_activation
+resgate_kwargs = dict(d_model=d_model, gate_application=gate_application, gate_compute=gate_compute, gate_activation=gate_activation)
+model_config = dict(
+    vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dff=dff, activation=activation, resgate_kwargs=resgate_kwargs,
     dropout_rate=dropout_rate, norm_first=norm_first, norm_type=norm_type, max_block_size=max_seq_len, bias=bias, pos_enc_type=pos_enc_type)
 
 run_config = dict(optimizer_config=optimizer_config, training_config=training_config, use_compile=use_compile, use_bf16=use_bf16, model_config=model_config)
