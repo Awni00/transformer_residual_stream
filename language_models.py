@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from transformer_blocks import EncoderBlock, create_norm
 from attention_utils import precompute_freqs_cis
+import math
 
 class TransformerLM(nn.Module):
     """Transformer Language Model"""
@@ -16,6 +17,7 @@ class TransformerLM(nn.Module):
         activation: str,
         norm_first: bool,
         max_block_size: int,
+        resgate_kwargs: dict = None,
         norm_type: str = 'layernorm',
         bias: bool = True,
         pos_enc_type: str = 'pos_emb',
@@ -65,13 +67,15 @@ class TransformerLM(nn.Module):
         self.norm_type = norm_type
         self.bias = bias
         self.pos_enc_type = pos_enc_type
+        self.resgate_kwargs = resgate_kwargs
         self.use_flash_attention = use_flash_attention
         self._need_weights = not use_flash_attention # used to specify whether flash attention is used
 
         layers = dict(
             token_embedder = nn.Embedding(vocab_size, d_model),
             dropout = nn.Dropout(dropout_rate),
-            blocks = nn.ModuleList([EncoderBlock(d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate,
+            blocks = nn.ModuleList([EncoderBlock(
+                d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate, resgate_kwargs=resgate_kwargs,
                 activation=activation, norm_first=norm_first, norm_type=norm_type, bias=bias, causal=True) for _ in range(n_layers)]),
             norm = create_norm(d_model, self.norm_type),
             final_out = nn.Linear(d_model, vocab_size, bias=False)
@@ -98,12 +102,16 @@ class TransformerLM(nn.Module):
         self.apply(self._init_weights)
         # NOTE: previously, I did not apply special initialization, but it turns out that it is important
 
-        # TODO: decide whether to keep this
-        # mlp_special_init_layer = 'linear3' if activation == 'swiglu' else 'linear2'
-        # for pn, p in self.named_parameters():
-        #     # apply special n_layer-scaled initialization to output projection of attention and last layer of mlp
-        #     if pn.endswith(f'{mlp_special_init_layer}.weight') or pn.endswith('wo.weight'):
-        #         torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+
+        # per-GPT2 paper, scale intialization of output projection and last layer of mlp
+        # apply special n_layer-scaled initialization to layers that add to the residual stream
+        # (output projection of attention and last layer of mlp)
+        # this ensures that, at initialization, adding to the residual stream does not cause things to blow up
+        # note: while the _init_weights seemed to have a big effect, it is unclear what effect this is having
+        mlp_special_init_layer = 'linear3' if activation == 'swiglu' else 'linear2'
+        for pn, p in self.named_parameters():
+            if pn.endswith(f'{mlp_special_init_layer}.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

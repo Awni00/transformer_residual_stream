@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from attention import Attention
+from resgate import ResidualGate
 import model_utils
 
 class EncoderBlock(nn.Module):
@@ -14,6 +15,7 @@ class EncoderBlock(nn.Module):
             norm_first: bool,
             norm_type: str = 'layernorm',
             bias: bool = True,
+            resgate_kwargs: dict = None,
             causal: bool = False):
         """
         A Transformer Encoder Block.
@@ -38,6 +40,8 @@ class EncoderBlock(nn.Module):
             type of normalization to use. 'layernorm' or 'rmsnorm'. Default is 'layernorm'.
         bias : bool, optional
             whether to use bias in multi-head attention, by default True
+        resgate_kwargs : dict, optional
+            keyword arguments for ResidualGate, by default None
         causal : bool, optional
             whether self-attention should be causal, by default False
         """
@@ -61,14 +65,28 @@ class EncoderBlock(nn.Module):
         self.norm2 = create_norm(self.d_model, self.norm_type)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
+        if resgate_kwargs is None:
+            resgate_kwargs = dict(d_model=self.d_model, gate_application='none')
+
+        # TODO: currently, same gating mechanism is applied to both attention and feed-forward block
+        # make configurable, s.t. can gate only only one of them
+        self.resgate_attn = ResidualGate(**resgate_kwargs)
+        self.resgate_ff = ResidualGate(**resgate_kwargs)
+
     def forward(self, x, freqs_cos=None, freqs_sin=None, need_weights=False):
         if self.norm_first:
-            x = x + self._compute_self_attn(self.norm1(x), freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=need_weights)
-            x = x + self._apply_ff_block(self.norm2(x))
+            y = self._compute_self_attn(self.norm1(x), freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=need_weights)
+            x = self.resgate_attn(x, y)
+
+            y = self._apply_ff_block(self.norm2(x))
+            x = self.resgate_ff(x, y)
         else:
-            x = self.norm1(x + self._compute_self_attn(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=need_weights))
+            y = self._compute_self_attn(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, need_weights=need_weights)
+            x = self.norm1(self.resgate_attn(x, y))
+
             x = self.dropout(x)
-            x = self.norm2(x + self._apply_ff_block(x))
+            y = self._apply_ff_block(x)
+            x = self.norm2(self.resgate_ff(x, y))
         return x
 
     def _compute_self_attn(self, x, freqs_cos=None, freqs_sin=None, need_weights=False):
@@ -208,6 +226,7 @@ class FeedForwardBlock(nn.Module):
 
         super().__init__()
         self.embed_dim = embed_dim
+        # TODO: if dff is None and activation is swiglu, then dff should be calculated differently (s.t. total num params is the same as with relu)
         self.dff = dff if dff is not None else 4 * embed_dim
         self.use_bias = use_bias
         self.activation = activation
