@@ -18,8 +18,9 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from language_models import TransformerLM,  configure_optimizers
+# from language_models import TransformerLM,  configure_optimizers
 # from gpt2_model import GPT, GPTConfig
+from resgate_language_models import TransformerLM, configure_optimizers
 
 # Create argument parser
 parser = argparse.ArgumentParser(description='Pretrain script for transformer_residual_stream')
@@ -67,6 +68,9 @@ parser.add_argument('--max_block_size', type=int, default=1024, help='Maximum bl
 parser.add_argument('--bias', type=int, default=0, help='Whether to include bias in the model')
 parser.add_argument('--pos_enc_type', type=str, default='RoPE', help='Type of positional encoding')
 
+# Add arguments for residual gate configuration
+parser.add_argument('--gate_on', choices=('attn', 'ffn', 'attn-ffn', 'none'), default='none', help='Where to apply residual gate')
+parser.add_argument('--gate_bias_init', type=float, default=3., help='initialization value for bias in residual gate')
 parser.add_argument('--gate_application', type=str, default='none', help='Ways of applying gate')
 parser.add_argument('--gate_compute', type=str, default='linear-bias', help='Ways of computing gates')
 parser.add_argument('--gate_activation', type=str, default='sigmoid', help='Type of positional encoding')
@@ -127,7 +131,16 @@ pos_enc_type = args.pos_enc_type
 gate_application = args.gate_application
 gate_compute = args.gate_compute
 gate_activation = args.gate_activation
-resgate_kwargs = dict(d_model=d_model, gate_application=gate_application, gate_compute=gate_compute, gate_activation=gate_activation)
+gate_on = args.gate_on
+
+# Residual gate configuration
+resgate_kwargs = dict()
+resgate_kwargs_ = dict(d_model=d_model, gate_application=gate_application, gate_compute=gate_compute, gate_activation=gate_activation, bias_init_val=args.gate_bias_init)
+if 'attn' in gate_on:
+    resgate_kwargs['attn'] = resgate_kwargs_
+if 'ffn' in gate_on:
+    resgate_kwargs['ffn'] = resgate_kwargs_
+
 model_config = dict(
     vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dff=dff, activation=activation, resgate_kwargs=resgate_kwargs,
     dropout_rate=dropout_rate, norm_first=norm_first, norm_type=norm_type, max_block_size=max_seq_len, bias=bias, pos_enc_type=pos_enc_type)
