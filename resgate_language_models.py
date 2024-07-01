@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformer_blocks import EncoderBlock, create_norm
+from resgate_transformer_blocks import EncoderBlock, create_norm
 from attention_utils import precompute_freqs_cis
 import math
 
@@ -154,6 +154,7 @@ class TransformerLM(nn.Module):
 
         return logits, loss
 
+    # TODO: add function initialize_from_pretrained_gateless
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """

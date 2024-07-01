@@ -65,13 +65,18 @@ class EncoderBlock(nn.Module):
         self.norm2 = create_norm(self.d_model, self.norm_type)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
-        if resgate_kwargs is None:
-            resgate_kwargs = dict(d_model=self.d_model, gate_application='none')
+        self.resgate_kwargs = resgate_kwargs if resgate_kwargs is not None else dict(attn=None, ff=None)
 
-        # TODO: currently, same gating mechanism is applied to both attention and feed-forward block
-        # make configurable, s.t. can gate only only one of them
-        self.resgate_attn = ResidualGate(**resgate_kwargs)
-        self.resgate_ff = ResidualGate(**resgate_kwargs)
+        self.resgate_attn_kwargs = self.resgate_kwargs.get('attn', None)
+        self.resgate_ff_kwargs = self.resgate_kwargs.get('ff', None)
+
+        if self.resgate_attn_kwargs is None:
+            self.resgate_attn_kwargs = dict(d_model=self.d_model, gate_application='none')
+        if self.resgate_ff_kwargs is None:
+            self.resgate_ff_kwargs = dict(d_model=self.d_model, gate_application='none')
+
+        self.resgate_attn = ResidualGate(**self.resgate_attn_kwargs)
+        self.resgate_ff = ResidualGate(**self.resgate_ff_kwargs)
 
     def forward(self, x, freqs_cos=None, freqs_sin=None, need_weights=False):
         if self.norm_first:
