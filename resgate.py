@@ -7,6 +7,7 @@ class ResidualGate(nn.Module):
             gate_application: str = 'reset-update', # 'reset-update' or 'reset' or 'update' or 'combined' or 'none'
             gate_compute: str = 'linear-bias', # 'linear-bias' or 'linear' or 'bias'
             gate_activation: str = 'sigmoid', # 'sigmoid' or 'tanh' or 'none
+            bias_init_val: float = 0. # bias initialization
             ):
         super(ResidualGate, self).__init__()
 
@@ -15,17 +16,23 @@ class ResidualGate(nn.Module):
         self.gate_compute = gate_compute
         self.gate_activation = gate_activation
         self.gate_activation_fn = nn.Sigmoid() if gate_activation == 'sigmoid' else nn.Tanh() if gate_activation == 'tanh' else None
-
+        self.bias_init_val = bias_init_val
 
         if gate_compute in ['linear-bias', 'linear']:
             bias = (gate_compute == 'linear-bias')
             if gate_application == 'reset-update':
                 self.update_gate_linear = nn.Linear(d_model, d_model, bias=bias)
                 self.reset_gate_linear = nn.Linear(d_model, d_model, bias=bias)
+                self.init_bias(self.update_gate_linear.bias, sign=1)
+                self.init_bias(self.reset_gate_linear.bias, sign=1)
             elif gate_application == 'reset' or gate_application == 'combined':
                 self.reset_gate_linear = nn.Linear(d_model, d_model, bias=bias)
+                self.init_bias(self.reset_gate_linear.bias, sign=1)
+                if gate_application == 'combined': # if combined, bias should be balanced
+                    self.init_bias(self.reset_gate_linear.bias, sign=0)
             elif gate_application == 'update':
                 self.update_gate_linear = nn.Linear(d_model, d_model, bias=bias)
+                self.init_bias(self.update_gate_linear.bias, sign=1)
             elif gate_application == 'none':
                 pass
             else:
@@ -35,11 +42,17 @@ class ResidualGate(nn.Module):
             if gate_application == 'reset-update':
                 self.update_gate_bias = nn.Parameter(torch.zeros(d_model))
                 self.reset_gate_bias = nn.Parameter(torch.zeros(d_model))
+                self.init_bias(self.update_gate_bias, sign=1)
+                self.init_bias(self.reset_gate_bias, sign=1)
             elif gate_application == 'reset' or gate_application == 'combined':
-                self.reset_gate_bias = nn.Parameter(torch.zeros(d_model))
                 # in the combined case, the reset gate is used to compute g*x + (1-g)*y
+                self.reset_gate_bias = nn.Parameter(torch.zeros(d_model))
+                self.init_bias(self.reset_gate_bias, sign=1)
+                if gate_application == 'combined':
+                    self.init_bias(self.reset_gate_bias, sign=0)
             elif gate_application == 'update':
                 self.update_gate_bias = nn.Parameter(torch.zeros(d_model))
+                self.init_bias(self.update_gate_bias, sign=1)
             elif gate_application == 'none':
                 pass
             else:
@@ -47,7 +60,8 @@ class ResidualGate(nn.Module):
         elif gate_application != 'none':
             raise ValueError(f'Unknown gate_compute: {gate_compute}')
 
-    # TODO: bias initialization (non-zero)
+    def init_bias(self, param, sign):
+        nn.init.constant_(param, sign*self.bias_init_val)
 
     def _compute_update_gate(self, x):
         if self.gate_compute in ('linear', 'linear-bias'):
