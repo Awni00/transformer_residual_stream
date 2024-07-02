@@ -27,6 +27,7 @@ parser = argparse.ArgumentParser(description='Pretrain script for transformer_re
 
 # Add arguments for logging and checkpointing
 parser.add_argument('--wandb_log', type=int, default=1, help='Enable wandb logging')
+parser.add_argument('--wandb_watch', type=int, default=1, help='Enable wandb.watch for logging grads, weights, etc.')
 parser.add_argument('--wandb_project', type=str, default='fineweb', help='Wandb project name')
 parser.add_argument('--run_name', type=str, default=None, help='Name of the run')
 
@@ -43,8 +44,10 @@ parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning 
 parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value')
 
 # Add arguments about training procedure
+parser.add_argument('--train_log_interval', type=int, default=10, help='Interval for evaluation')
 parser.add_argument('--eval_interval', type=int, default=250, help='Interval for evaluation')
 parser.add_argument('--val_loss_steps', type=int, default=20, help='Number of steps for validation loss')
+parser.add_argument('--save_checkpoints', type=int, default=1, help='Whether to save checkpoints')
 parser.add_argument('--save_interval', type=int, default=5000, help='Interval for saving model')
 parser.add_argument('--gen_interval', type=int, default=250, help='Interval for generation')
 parser.add_argument('--max_steps', type=int, default=19073, help='Maximum number of steps') # TODO change to calculate dynamically as # of tokens?
@@ -82,8 +85,11 @@ parser.add_argument('--seed', type=int, default=None, help='Random seed')
 # Parse arguments
 args = parser.parse_args()
 
+# TODO: add train config set up? e.g., read from config file?
+
 # Logging and checkpointing configuration
 wandb_log = bool(args.wandb_log)
+wandb_watch = bool(args.wandb_watch)
 wandb_project = args.wandb_project
 run_name = args.run_name
 
@@ -103,6 +109,7 @@ optimizer_config = dict(
     weight_decay=weight_decay, betas=betas, learning_rate=learning_rate, grad_clip=grad_clip)
 
 # Training procedure
+train_log_interval = args.train_log_interval
 eval_interval = args.eval_interval
 save_interval = args.save_interval
 val_loss_steps = args.val_loss_steps
@@ -205,6 +212,7 @@ enc = tiktoken.get_encoding("gpt2")
 # calculate gradient accumulation steps
 assert total_batch_size % (micro_batch_size * max_seq_len * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (micro_batch_size * max_seq_len * ddp_world_size)
+run_config['training_config']['grad_accum_steps'] = grad_accum_steps
 
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
@@ -359,7 +367,25 @@ def generate_samples():
         decoded = enc.decode(tokens)
         print(f"rank {ddp_rank} sample {i}: {decoded}")
 
+# utility function for getting the gradient norms
+
+def get_layerwise_grad_norms(model):
+    # get grad norm for each layer / block (viewed as a single vector)
+    layerwise_grad_norms = dict()
+    for l, block in enumerate(model.layers.blocks):
+        layer_l_grad_norm = torch.concat([p.grad.flatten() for p in block.parameters() if p.grad is not None]).norm(p=2)
+        layerwise_grad_norms[f'block_{l+1}'] = layer_l_grad_norm.detach().item()
+    return layerwise_grad_norms
+
+def get_grad_norms(model):
+    # get grad norm for each parameter
+    return {pn: torch.norm(p.grad, p='fro').detach().item() for pn, p in model.layers.named_parameters() if p.grad is not None}
+
 # endregion
+
+# TODO: do manually...
+if wandb_log and wandb_watch:
+    wandb.watch(model, log="all", log_freq=eval_interval*grad_accum_steps, log_graph=True) # log gradients, weights, biases, etc.
 
 for step in range(max_steps):
     t0 = time.time()
@@ -369,7 +395,10 @@ for step in range(max_steps):
     if step % eval_interval == 0 or last_step:
         val_loss_accum = eval_val_loss()
 
+
         if master_process:
+            # compute and log the gradient norms (currently only for the master process)
+
             print(f"step {step:5d} | val loss {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"step {step:5d} | val loss {val_loss_accum.item():.4f}\n")
@@ -377,10 +406,16 @@ for step in range(max_steps):
             if wandb_log:
                 try:
                     wandb.log({"loss/val": val_loss_accum.item()}, step = step)
+
+                    if step > 0:
+                        param_grad_norms = get_grad_norms(model)
+                        layer_grad_norms = get_layerwise_grad_norms(model)
+                        wandb.log({f'grad_norms/{pn}': gn for pn, gn in param_grad_norms.items()}, step = step)
+                        wandb.log({f'layer_grad_norms/{ln}': gn for ln, gn in layer_grad_norms.items()}, step = step)
                 except Exception as e:
                     print(f"logging to wandb failed: {e}")
 
-            if step > 0 and (step % save_interval == 0 or last_step):
+            if step > 0 and (step % save_interval == 0 or last_step) and args.save_checkpoints:
                 save_checkpoint()
 
     # once in a while evaluate hellaswag
@@ -438,15 +473,14 @@ for step in range(max_steps):
             f.write(log_string + "\n")
 
         # log to wandb
-        if wandb_log:
+        if wandb_log and step % train_log_interval == 0:
             try:
                 wandb.log(
                     {
                         "step": step,
                         "tokens": step * grad_accum_steps * ddp_world_size * micro_batch_size * max_seq_len,
                         "loss/train": loss_accum.item(),
-                        # "loss/val": val_loss_accum.item(),
-                        "norm": norm, # TODO: log gradient norm separated across layers
+                        "norm": norm,
                         "lr": lr,
                         # "mfu": running_mfu * 100,  # convert to percentage
                     }, step = step
