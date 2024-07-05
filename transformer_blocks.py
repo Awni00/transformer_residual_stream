@@ -218,8 +218,15 @@ class FeedForwardBlock(nn.Module):
 
         super().__init__()
         self.embed_dim = embed_dim
-        # TODO: if dff is None and activation is swiglu, then dff should be calculated differently (s.t. total num params is the same as with relu)
-        self.dff = dff if dff is not None else 4 * embed_dim
+
+        # set dff according to activation function if not given
+        if dff is None and activation == 'swiglu':
+            self.dff = int(2/3 * 4 * embed_dim)
+        elif dff is None:
+            self.dff = 4 * embed_dim
+        else:
+            self.dff = dff
+
         self.use_bias = use_bias
         self.activation = activation
         if self.activation != 'swiglu':
