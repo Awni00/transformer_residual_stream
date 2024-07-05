@@ -13,6 +13,7 @@ class Attention(nn.Module):
             d_model: int,
             n_heads: int,
             dropout: float,
+            key_dim: int = None,
             n_kv_heads: int = None,
             add_bias_kv: bool = False,
             add_bias_out: bool = False,
@@ -55,6 +56,7 @@ class Attention(nn.Module):
         self.add_bias_out = add_bias_out
         self.total_n_heads = n_heads if total_n_heads is None else total_n_heads # compatibility for dual attention
 
+        self.key_dim = key_dim if key_dim is not None else self.d_model // self.total_n_heads # key dimension
         self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
         self.head_dim = self.d_model // self.total_n_heads # dim of projections
         assert self.n_heads % self.n_kv_heads == 0 # make sure n_kv_heads fits into n_heads (i.e., can be grouped)
@@ -63,8 +65,8 @@ class Attention(nn.Module):
 
         self.attn_scale = 1 / math.sqrt(self.head_dim) # for scaled dot product attention
 
-        self.wq = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=self.add_bias_kv)
+        self.wq = nn.Linear(self.d_model, self.n_heads * self.key_dim, bias=False)
+        self.wk = nn.Linear(self.d_model, self.n_kv_heads * self.key_dim, bias=self.add_bias_kv)
         self.wv = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=self.add_bias_kv)
         self.wo = nn.Linear(self.n_heads * self.head_dim, self.n_heads * self.head_dim, bias=self.add_bias_out)
         self.attn_dropout = nn.Dropout(self.dropout)
@@ -125,8 +127,8 @@ class Attention(nn.Module):
 
         # apply query/key/value projections and reshape to split into different heads
         xq, xk, xv = self.wq(query), self.wk(key), self.wv(value)
-        xq = xq.view(bsz, qseqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, kseqlen, self.n_kv_heads, self.head_dim)
+        xq = xq.view(bsz, qseqlen, self.n_heads, self.key_dim)
+        xk = xk.view(bsz, kseqlen, self.n_kv_heads, self.key_dim)
         xv = xv.view(bsz, vseqlen, self.n_kv_heads, self.head_dim)
 
         # apply RoPE relative positional embeddings (if given)
@@ -135,11 +137,11 @@ class Attention(nn.Module):
 
         # grouped multiquery attention: expand out keys and values
         if self.n_rep_kv != 1:
-            xk = repeat_kv(xk, self.n_rep_kv)  # (bs, seqlen, n_heads, head_dim)
+            xk = repeat_kv(xk, self.n_rep_kv)  # (bs, seqlen, n_heads, key_dim)
             xv = repeat_kv(xv, self.n_rep_kv)  # (bs, seqlen, n_heads, head_dim)
 
         # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, key_dim)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
