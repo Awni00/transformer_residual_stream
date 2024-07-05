@@ -15,7 +15,9 @@ class EncoderBlock(nn.Module):
             norm_first: bool,
             norm_type: str = 'layernorm',
             bias: bool = True,
-            causal: bool = False):
+            causal: bool = False,
+            attn_kwargs: dict = None,
+            ):
         """
         A Transformer Encoder Block.
 
@@ -54,13 +56,16 @@ class EncoderBlock(nn.Module):
         self.norm_first = norm_first
         self.norm_type = norm_type
         self.bias = bias
+        self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
+        if attn_kwargs is not None:
+            self.attn_kwargs.update(attn_kwargs)
         self.causal = causal
 
         self.dropout = nn.Dropout(self.dropout_rate)
         self.norm1 = create_norm(self.d_model, self.norm_type)
         self.self_attn = Attention(
-            d_model=self.d_model, n_heads=self.n_heads, n_kv_heads=None,
-            add_bias_kv=False, add_bias_out=self.bias, dropout=self.dropout_rate)
+            d_model=self.d_model, n_heads=self.n_heads, add_bias_out=self.bias,
+            dropout=self.dropout_rate, **self.attn_kwargs)
         self.norm2 = create_norm(self.d_model, self.norm_type)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
