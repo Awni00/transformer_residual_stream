@@ -222,7 +222,6 @@ class RelationalAttention(nn.Module):
         self.d_model = d_model # model dimension
         self.n_heads = n_heads # number of heads (for query)
         self.n_relations = n_relations if n_relations is not None else n_heads # number of relations
-        self.rel_proj_dim = rel_proj_dim if rel_proj_dim is not None else d_model // self.n_relations # dimension of relation projections
         self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads # n_kv_heads = 1 corresponds to multi-query attn
         self.rel_activation = rel_activation # "relation activation function"
         self.rel_activation_ = model_utils.get_activation_function(rel_activation)
@@ -230,10 +229,12 @@ class RelationalAttention(nn.Module):
         self.dropout = dropout
         self.add_bias_kv = add_bias_kv # whether to add bias to key/value projections
         self.add_bias_out = add_bias_out # whether to add bias to output projection
-        self.total_n_heads = n_heads if total_n_heads is None else total_n_heads # total number of heads in abstract attention
         self.use_relative_positional_symbols = use_relative_positional_symbols # whether to use relative positional symbols
 
+        self.total_n_heads = n_heads if total_n_heads is None else total_n_heads # total number of heads in abstract attention
         self.key_dim = key_dim if key_dim is not None else self.d_model // self.total_n_heads # key dimension
+        self.rel_proj_dim = rel_proj_dim if rel_proj_dim is not None else self.key_dim # dimension of relation projections
+
         self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
         self.head_dim = self.d_model // self.total_n_heads # dim of projections
 
@@ -309,26 +310,11 @@ class RelationalAttention(nn.Module):
 
         bsz, seqlen, _ = x.shape
 
+        ## compute attention scores
         # apply query/key projections for attention and reshape to split into different heads
         xq_attn, xk_attn = self.wq_attn(x), self.wk_attn(x) # shape: [bsz, seqlen, d_model] (d_model = n_heads * head_dim)
         xq_attn = rearrange(xq_attn, 'b l (nh hd) -> b l nh hd', nh=self.n_heads) # shape: [bsz, seqlen, n_heads, head_dim]
         xk_attn = rearrange(xk_attn, 'b l (nh hd) -> b l nh hd', nh=self.n_kv_heads) # shape: [bsz, seqlen, n_kv_heads, head_dim]
-
-
-        # apply query/key projections for relation and reshape to split into different heads
-        xq_rel, xk_rel = self.wq_rel(x), self.wk_rel(x) # shape: [bsz, seqlen, n_rels * rel_proj_dim]
-        xq_rel = rearrange(xq_rel, 'b l (nr rd) -> b l nr rd', nr=self.n_relations) # shape: [bsz, seqlen, n_relations, rel_proj_dim]
-        xk_rel = rearrange(xk_rel, 'b l (nr rd) -> b l nr rd', nr=self.n_relations) # shape: [bsz, seqlen, n_relations, rel_proj_dim]
-
-        # apply value projection to symbols
-        sv = self.wv(symbols) # shape: [bsz, seqlen, d_model] or [seqlen, seqlen, d_model] if use_relative_positional_symbols
-
-        if self.use_relative_positional_symbols:
-            # make sure symbols are of shape [len, len, dim]
-            assert symbols.shape[0] == symbols.shape[1] == seqlen, f"symbols must be of shape [len, len, dim], received {symbols.shape}"
-            sv = rearrange(sv, 'l1 l2 (nh hd) -> l1 l2 nh hd', nh=self.n_kv_heads) # shape: [seqlen, seqlen, n_kv_heads, head_dim]
-        else:
-            sv = rearrange(sv, 'b l (nh hd) -> b l nh hd', nh=self.n_kv_heads) # shape: [bsz, seqlen, n_kv_heads, head_dim]
 
         # apply RoPE relative positional embeddings (if given)
         if freqs_cos is not None and freqs_sin is not None:
@@ -337,15 +323,10 @@ class RelationalAttention(nn.Module):
         # grouped multiquery attention: expand out keys and values
         if self.n_rep_kv != 1:
             xk_attn = repeat_kv(xk_attn, self.n_rep_kv)  # (bs, seqlen, n_heads, head_dim)
-            sv = repeat_kv(sv, self.n_rep_kv)  # (bs, seqlen, n_heads, head_dim)
-
 
         # transpose for matmul, make heads into a batch dimension
         xq_attn = xq_attn.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
         xk_attn = xk_attn.transpose(1, 2) # (bs, n_heads, seqlen, head_dim)
-        xq_rel = xq_rel.transpose(1, 2) # (bs, n_heads, seqlen, head_dim)
-        xk_rel = xk_rel.transpose(1, 2) # (bs, n_heads, seqlen, head_dim)
-        # sv: (seq_len, seq_len, n_heads, head_dim) or (bs, seq_len, n_heads, head_dim)
 
         assert not (attn_mask is not None and is_causal) # attn_mask must not be given if is_causal
         # if is_causal create attn_mask
@@ -367,6 +348,31 @@ class RelationalAttention(nn.Module):
         attn_scores = self.attn_dropout(attn_scores)
         # NOTE: does it make sense to dropout attention scores?
         # it's done in Vaswani et al's original implementation and continues to be used, but standard dropout is not "closed under" simplex...
+
+
+        ## compute relations
+        # apply query/key projections for relation and reshape to split into different heads
+        xq_rel, xk_rel = self.wq_rel(x), self.wk_rel(x) # shape: [bsz, seqlen, n_rels * rel_proj_dim]
+        xq_rel = rearrange(xq_rel, 'b l (nr rd) -> b l nr rd', nr=self.n_relations) # shape: [bsz, seqlen, n_relations, rel_proj_dim]
+        xk_rel = rearrange(xk_rel, 'b l (nr rd) -> b l nr rd', nr=self.n_relations) # shape: [bsz, seqlen, n_relations, rel_proj_dim]
+
+        # apply value projection to symbols
+        sv = self.wv(symbols) # shape: [bsz, seqlen, d_model] or [seqlen, seqlen, d_model] if use_relative_positional_symbols
+        # grouped multiquery attention: expand out keys and values
+
+        if self.use_relative_positional_symbols:
+            # make sure symbols are of shape [len, len, dim]
+            assert symbols.shape[0] == symbols.shape[1] == seqlen, f"symbols must be of shape [len, len, dim], received {symbols.shape}"
+            sv = rearrange(sv, 'l1 l2 (nh hd) -> l1 l2 nh hd', nh=self.n_kv_heads) # shape: [seqlen, seqlen, n_kv_heads, head_dim]
+        else:
+            sv = rearrange(sv, 'b l (nh hd) -> b l nh hd', nh=self.n_kv_heads) # shape: [bsz, seqlen, n_kv_heads, head_dim]
+
+        if self.n_rep_kv != 1:
+            sv = repeat_kv(sv, self.n_rep_kv)  # (bs, seqlen, n_heads, head_dim)
+
+        xq_rel = xq_rel.transpose(1, 2) # (bs, n_heads, seqlen, head_dim)
+        xk_rel = xk_rel.transpose(1, 2) # (bs, n_heads, seqlen, head_dim)
+        # sv: (seq_len, seq_len, n_heads, head_dim) or (bs, seq_len, n_heads, head_dim)
 
         # compute relations
         # Math: r(x_i, x_j) = (\langle W_q^{rel,\ell} x_i, W_k^{rel,\ell} x_j \rangle)_{\ell \in [d_r]}
@@ -412,9 +418,6 @@ class RelationalAttention(nn.Module):
         return output, attn_scores, relations
 
 # region Symbol Assignment Mechanisms
-import torch
-import torch.nn as nn
-from positional_encoding import RelativePositionalEncoding
 
 class SymbolicAttention(nn.Module):
     def __init__(self,
@@ -556,170 +559,6 @@ class PositionRelativeSymbolRetriever(nn.Module):
         length = x.shape[1]
         return self.rel_pos_enc(length)
 
-class RelationalSymbolicAttention(nn.Module):
-    def __init__(self,
-            d_model: int,
-            rel_n_heads: int,
-            symbolic_attn_n_heads: int,
-            n_symbols: int,
-            nbhd_delta: int,
-            causal_nbhd: bool = True,
-            include_self: bool = False,
-            normalize_rels: bool = True,
-            dropout: float = 0.0,
-            rel_scale: float = None,
-            symbolic_attn_scale: float = None):
-        """
-        Relational symbolic attention module.
-
-        Retrieves a symbol for each object in the input based on its relationship with its neighborhood.
-        First, we compute a local relation vector for each object in the input. This local relation vector
-        is then used to retrieve a symbol from the symbol library via symbolic attention.
-
-        Parameters
-        ----------
-        d_model : int
-            Model dimension. this is the dimension of the input and the dimension of the symbols and template features.
-        rel_n_heads : int
-            Dimensionality of relations computed with neighborhood.
-        symbolic_attn_n_heads : int
-            Number of symbolic attention heads.
-        n_symbols : int
-            Number of symbols to learn in the symbol library.
-        nbhd_delta : int
-            The size of the neighborhood.
-        causal_nbhd : bool, optional
-            Whether to use causal neighborhood. if causal_nbhd is True, the neighborhood is [i-nbhd_delta, i].
-            if causal_nbhd is False, the neighborhood is [i-nbhd_delta, i+nbhd_delta]. Defaults to True.
-        include_self : bool, optional
-            Whether to include self in the neighborhood. E.g., if False and causal_nbhd, the neighborhood is
-            [i-nbhd_delta, i-1]. If False and not causal_nbhd, the neighborhood is [i-nbhd_delta, i-1] U [i+1, i+nbhd_delta].
-            Defaults to False.
-        normalize_rels : bool, optional
-            Whether to normalize relations with softmax across neighborhood. Defaults to True.
-        dropout : float, optional
-            The dropout rate. Defaults to 0.0.
-        rel_scale : float, optional
-            The scaling factor when normalizing relations via softmax. If None, it is computed based on model_dim and rel_n_heads.
-        symbolic_attn_scale : float, optional
-            The scaling factor used in symbolic attention.
-
-        Attributes
-        ----------
-        symbolic_attention : SymbolicAttention
-            The symbolic attention module.
-        q_proj : nn.Linear
-            Linear layer for projecting the query.
-        k_proj : nn.Linear
-            Linear layer for projecting the key.
-        model_dim_proj : nn.Linear
-            Linear layer for projecting the neighborhood relation vector to model_dim.
-        """
-
-        super().__init__()
-
-        self.d_model = d_model
-        self.rel_n_heads = rel_n_heads
-        self.symbolic_attn_n_heads = symbolic_attn_n_heads
-        self.n_symbols = n_symbols
-        self.nbhd_delta = nbhd_delta
-        self.causal_nbhd = causal_nbhd
-        self.dropout = dropout
-        self.rel_scale = rel_scale if rel_scale is not None else (d_model//rel_n_heads) ** -0.5
-        self.symbolic_attn_scale = symbolic_attn_scale
-        self.include_self = include_self
-        self.normalize_rels = normalize_rels
-
-        self.nbhd_rel_dim = self._compute_nbhd_rel_dim(rel_n_heads, nbhd_delta, causal_nbhd, include_self)
-
-        self.symbolic_attention = SymbolicAttention(d_model, symbolic_attn_n_heads, n_symbols, dropout, symbolic_attn_scale)
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.model_dim_proj = nn.Linear(self.nbhd_rel_dim, d_model) # project neighborhood relation vector to model_dim
-
-    def forward(self, x):
-        batch_size, seq_len, dim = x.size()
-
-        # compute query and key transformations to compute relations with neighborhood
-        query = self.q_proj(x)
-        key = self.k_proj(x)
-
-        # reshape to (batch_size, n_heads, n, d_k); i.e., split model_dim into n_heads
-        query = query.view(batch_size, seq_len, self.rel_n_heads, self.d_model // self.rel_n_heads).transpose(1, 2)
-        key = key.view(batch_size, seq_len, self.rel_n_heads, self.d_model // self.rel_n_heads).transpose(1, 2)
-
-        # compute neighborhood mask
-        if self.causal_nbhd:
-            neighbor_mask = self.compute_causal_neighbor_mask(seq_len, self.nbhd_delta, self.include_self)
-        else:
-            neighbor_mask = self.compute_neighbor_mask(seq_len, self.nbhd_delta, self.include_self)
-
-        neighborhood_keys = key[:, :, neighbor_mask] # (batch_size, n_heads, n, Delta, d_k)
-
-        # compute relations with neighborhood
-        # einstein summation: R[b,h,i,j] = sum_d Q[b,h,i,d] * nbhd_K[b,h,i,j,d], where nhbd_K[b,h,i,j,d] = K[b,h,i,i-j,d]
-        neighbor_rel_tensor = torch.einsum('bhid,bhijd->bhij', query, neighborhood_keys) # (batch_size, n_heads, n, Delta)
-
-        if self.normalize_rels:
-            # normalize relations across neigborhood (of size Delta)
-            neighbor_rel_tensor = torch.softmax(neighbor_rel_tensor * self.rel_scale, dim=-1)
-
-
-        # permute dims to shape (batch_size, n, Delta, n_heads)
-        neighbor_rel_tensor = neighbor_rel_tensor.permute(0, 2, 3, 1)
-
-        # flatten n_heads dimension to get shape (batch_size, n, nbhd_rel_dim) [e.g., nbhd_rel_dim = Delta * n_heads]
-        neighbor_rel_tensor = neighbor_rel_tensor.contiguous().view(batch_size, -1, self.nbhd_rel_dim)
-
-        # project neighborhood relation vector to model_dim
-        neighbor_rel_tensor = self.model_dim_proj(neighbor_rel_tensor)
-
-        # compute symbolic attention
-        retrieved_symbols = self.symbolic_attention(neighbor_rel_tensor)
-
-        return retrieved_symbols
-
-    def _compute_nbhd_rel_dim(self, rel_n_heads, nbhd_delta, causal_nbhd, include_self):
-        '''computes the dimension of the neigborhood relation vector'''
-
-        if causal_nbhd:
-            if include_self:
-                return rel_n_heads * (nbhd_delta + 1)
-            else:
-                return rel_n_heads * nbhd_delta
-        else:
-            if include_self:
-                return rel_n_heads * (2 * nbhd_delta + 1)
-            else:
-                return rel_n_heads * (2 * nbhd_delta)
-
-    @staticmethod
-    def compute_neighbor_mask(n, delta, include_self=True):
-        '''computes the neighborhood mask for a sequence of length n and neighborhood size delta'''
-
-        sequence = torch.arange(n).unsqueeze(1)
-        if include_self:
-            neighborhood = torch.arange(-delta, delta + 1).unsqueeze(0)
-        else:
-            neighborhood = torch.concat([torch.arange(-delta, 0), torch.arange(1, delta + 1)]).unsqueeze(0)
-
-        mask = sequence + neighborhood
-        mask = mask.clamp(0, n - 1)
-        return mask
-
-    @staticmethod
-    def compute_causal_neighbor_mask(n, delta, include_self=False):
-        '''computes the causal neighborhood mask for a sequence of length n and neighborhood size delta'''
-
-        sequence = torch.arange(n).unsqueeze(1)
-        if include_self:
-            neighborhood = torch.arange(delta + 1).unsqueeze(0)
-        else:
-            neighborhood = torch.arange(1, delta + 1).unsqueeze(0)
-
-        mask = sequence - neighborhood
-        mask = mask.clamp(0, n - 1)
-        return mask
 # endregion
 
 # region Dual-Attention Blocks
