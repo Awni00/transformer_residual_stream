@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-import model_utils
 import math
 from einops import rearrange
 
@@ -219,7 +218,7 @@ class RelationalAttention(nn.Module):
         self.n_relations = n_relations if n_relations is not None else n_heads # number of relations
         self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads # n_kv_heads = 1 corresponds to multi-query attn
         self.rel_activation = rel_activation # "relation activation function"
-        self.rel_activation_ = model_utils.get_activation_function(rel_activation)
+        self.rel_activation_ = get_activation_function(rel_activation)
         self.symmetric_rels = symmetric_rels # whether to use symmetric relations
         self.dropout = dropout
         self.add_bias_kv = add_bias_kv # whether to add bias to key/value projections
@@ -964,6 +963,30 @@ class DualAttnTransformerLM(nn.Module):
         # weight-tying embedder and final layer
         self.layers.token_embedder.weight = self.layers.final_out.weight
 
+        # initialize weights
+        self.apply(self._init_weights)
+        # NOTE: previously, I did not apply special initialization, but it turns out that it is important
+
+
+        # per-GPT2 paper, scale intialization of output projection and last layer of mlp
+        # apply special n_layer-scaled initialization to layers that add to the residual stream
+        # (output projection of attention and last layer of mlp)
+        # this ensures that, at initialization, adding to the residual stream does not cause things to blow up
+        # note: while the _init_weights seemed to have a big effect, it is unclear what effect this is having
+        mlp_special_init_layer = 'linear3' if activation == 'swiglu' else 'linear2'
+        for pn, p in self.named_parameters():
+            if pn.endswith(f'{mlp_special_init_layer}.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
     def forward(self, x, targets=None):
         device = x.device
         b, t = x.size()
@@ -1313,7 +1336,7 @@ class FeedForwardBlock(nn.Module):
         self.use_bias = use_bias
         self.activation = activation
         if self.activation != 'swiglu':
-            self.activation_ = model_utils.get_activation_function(activation)
+            self.activation_ = get_activation_function(activation)
 
         self.linear1 = nn.Linear(self.embed_dim, self.dff, bias=self.use_bias)
         self.linear2 = nn.Linear(self.dff, self.embed_dim, bias=self.use_bias)
@@ -1351,6 +1374,25 @@ def create_norm(d_model, norm_type):
         return  nn.Identity()
     else:
         raise ValueError(f'norm_type {norm_type} not valid')
+
+def get_activation_function(name):
+    """gets activation function by its name."""
+
+    activation_dict = {
+        'relu': nn.ReLU(),
+        'sigmoid': nn.Sigmoid(),
+        'tanh': nn.Tanh(),
+        'gelu': nn.GELU(approximate='tanh'),
+        'silu': nn.SiLU(),
+        'softmax': nn.Softmax(dim=-1),
+        'identity': nn.Identity(),
+        # add more if needed
+    }
+    if name in activation_dict:
+        return activation_dict[name]
+    else:
+        raise ValueError(f'Activation function {name} not found in {activation_dict.keys()}')
+
 
 # Utilities associated with computing attention
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
