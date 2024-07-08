@@ -10,6 +10,7 @@ from datetime import datetime
 import argparse
 import torch
 import torchinfo
+from contextlib import nullcontext
 from hellaswag import render_example, iterate_examples, get_most_likely_row
 from fineweb.fineweb_dataloader import DataLoaderLite
 import tiktoken
@@ -27,7 +28,8 @@ parser = argparse.ArgumentParser(description='Pretrain script for transformer_re
 
 # Add arguments for logging and checkpointing
 parser.add_argument('--wandb_log', type=int, default=1, help='Enable wandb logging')
-parser.add_argument('--wandb_watch', type=int, default=1, help='Enable wandb.watch for logging grads, weights, etc.')
+parser.add_argument('--wandb_watch', type=int, default=0, help='Enable wandb.watch for logging grads, weights, etc.')
+parser.add_argument('--track_grad_norms', type=int, default=0, help='Whether to track gradient norms')
 parser.add_argument('--wandb_project', type=str, default='fineweb', help='Wandb project name')
 parser.add_argument('--run_name', type=str, default=None, help='Name of the run')
 
@@ -55,6 +57,7 @@ parser.add_argument('--max_steps', type=int, default=19073, help='Maximum number
 # Add arguments for cuda optimizations
 parser.add_argument('--compile', type=int, default=1, help='Enable torch.compile')
 parser.add_argument('--use_bf16', type=int, default=1, help='Use bfloat16 for matmuls')
+parser.add_argument('--use_tf32_matmul', type=int, default=1, help='Use bfloat16 for matmuls')
 
 # Add arguments for model configuration
 # default config matches GPT2-medium / GPT3-medium (124M params)
@@ -90,6 +93,7 @@ args = parser.parse_args()
 # Logging and checkpointing configuration
 wandb_log = bool(args.wandb_log)
 wandb_watch = bool(args.wandb_watch)
+track_grad_nroms = bool(args.track_grad_norms)
 wandb_project = args.wandb_project
 run_name = args.run_name
 
@@ -121,6 +125,7 @@ training_config = dict(eval_interval=eval_interval, save_interval=save_interval,
 # CUDA optimizations
 use_compile = bool(args.compile)
 use_bf16 = bool(args.use_bf16)
+use_tf32_matmul = bool(args.use_tf32_matmul)
 
 # Model configuration
 vocab_size = args.vocab_size
@@ -227,8 +232,9 @@ if master_process:
     print(f"found {len(val_loader.shards)} shards for trainsplit")
 
 # set up torch to use bfloat16 for matmuls
-if use_bf16:
+if use_tf32_matmul:
     torch.set_float32_matmul_precision('high')
+autocast_ctx_manager = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
 # create model
 model = TransformerLM(**model_config)
@@ -282,7 +288,7 @@ def eval_val_loss():
         for _ in range(val_loss_steps):
             x, y = val_loader.next_batch()
             x, y = x.to(device), y.to(device)
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with autocast_ctx_manager:
                 logits, loss = model(x, y)
             loss = loss / val_loss_steps
             val_loss_accum += loss.detach()
@@ -319,7 +325,7 @@ def eval_hellaswag():
         mask = mask.to(device)
         # get the logits
         with torch.no_grad():
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with autocast_ctx_manager:
                 logits, loss = model(tokens)
             pred_norm = get_most_likely_row(tokens, mask, logits)
         num_total += 1
@@ -352,7 +358,7 @@ def generate_samples():
 
     while xgen.size(1) < max_length:
         with torch.no_grad():
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with autocast_ctx_manager:
                 logits, loss = model(xgen) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
             probs = F.softmax(logits, dim=-1)
@@ -407,7 +413,7 @@ for step in range(max_steps):
                 try:
                     wandb.log({"loss/val": val_loss_accum.item()}, step = step)
 
-                    if step > 0:
+                    if track_grad_nroms and step > 0:
                         param_grad_norms = get_grad_norms(model)
                         layer_grad_norms = get_layerwise_grad_norms(model)
                         wandb.log({f'grad_norms/{pn}': gn for pn, gn in param_grad_norms.items()}, step = step)
@@ -418,9 +424,9 @@ for step in range(max_steps):
             if step > 0 and (step % save_interval == 0 or last_step) and args.save_checkpoints:
                 save_checkpoint()
 
-    # once in a while evaluate hellaswag
-    if (step % eval_interval == 0 or last_step) and (not use_compile): # TODO: fix hellaswag issue
-        eval_hellaswag()
+    # once in a while evaluate hellaswag NOTE: for now, not evaluating hellaswag
+    # if (step % eval_interval == 0 or last_step) and (not use_compile): # TODO: fix hellaswag issue
+        # eval_hellaswag()
 
     # # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % eval_interval == 0) or last_step) and (not use_compile):
@@ -436,7 +442,7 @@ for step in range(max_steps):
         # set up DDP syncing of accumulated gradients after final microbatch
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with autocast_ctx_manager:
             logits, loss = model(x, y)
         # note that the loss is scaled by the gradient accum steps 
         # because loss.backward() adds accumulated loss grads (not mean, which is what we want)
