@@ -21,6 +21,7 @@ class TransformerLM(nn.Module):
         bias: bool = True,
         pos_enc_type: str = 'pos_emb',
         use_flash_attention=True,
+        block_kwargs: dict = None
         ):
         """
         Transformer autoregressive language model.
@@ -66,6 +67,7 @@ class TransformerLM(nn.Module):
         self.norm_type = norm_type
         self.bias = bias
         self.pos_enc_type = pos_enc_type
+        self.block_kwargs = block_kwargs if block_kwargs is not None else {}
         self.use_flash_attention = use_flash_attention
         self._need_weights = not use_flash_attention # used to specify whether flash attention is used
 
@@ -73,8 +75,8 @@ class TransformerLM(nn.Module):
             token_embedder = nn.Embedding(vocab_size, d_model),
             dropout = nn.Dropout(dropout_rate),
             blocks = nn.ModuleList([EncoderBlock(
-                d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate,
-                activation=activation, norm_first=norm_first, norm_type=norm_type, bias=bias, causal=True) for _ in range(n_layers)]),
+                d_model=d_model, n_heads=n_heads, dff=dff, dropout_rate=dropout_rate, activation=activation,
+                norm_first=norm_first, norm_type=norm_type, bias=bias, causal=True, **self.block_kwargs) for _ in range(n_layers)]),
             norm = create_norm(d_model, self.norm_type),
             final_out = nn.Linear(d_model, vocab_size, bias=False)
             )
@@ -222,7 +224,7 @@ class TransformerLM(nn.Module):
 
         return idx
 
-def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
+def configure_optimizers(model, weight_decay, learning_rate, betas, device_type, use_fused_adam=True):
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in model.named_parameters()}
     # filter out those that do not require grad
@@ -240,7 +242,7 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
     print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
     print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
     # Create AdamW optimizer and use the fused version if it is available
-    use_fused = (device_type == 'cuda')
+    use_fused = (device_type == 'cuda') and use_fused_adam
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
     print(f"using fused AdamW: {use_fused}")
 
