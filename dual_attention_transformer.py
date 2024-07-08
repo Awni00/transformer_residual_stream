@@ -1004,9 +1004,10 @@ class DualAttnTransformerLM(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
             # NOTE: wr in relational attention is Parameter not Linear. do we need to init it the same way? FIXME
+        elif isinstance(module, RelationalAttention):
+            torch.nn.init.normal_(module.wr, mean=0.0, std=0.02) # wr is a nn.Parameter now so needs to be initialized separately
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
 
     def forward(self, x, targets=None):
         device = x.device
