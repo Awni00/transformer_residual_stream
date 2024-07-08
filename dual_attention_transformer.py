@@ -254,7 +254,8 @@ class RelationalAttention(nn.Module):
         # but rel Wq, Wk do not have this param. TODO: think about whether we want to adjust implementation?
 
         # W_r = (W_r^h)_h projection mapping r(x_i, x_j) to common dimension with symbols
-        self.wr = nn.Linear(self.n_relations, self.head_dim * self.n_heads, bias=False)
+        self.wr = nn.Parameter(torch.empty(self.n_heads, self.head_dim, self.n_relations))
+        torch.nn.init.kaiming_uniform_(self.wr, a=math.sqrt(5))
         # W_s = (W_s^h)_h = W_v projection for symbols
         self.wv = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=self.add_bias_kv)
         # Final output projection
@@ -343,7 +344,6 @@ class RelationalAttention(nn.Module):
         # NOTE: does it make sense to dropout attention scores?
         # it's done in Vaswani et al's original implementation and continues to be used, but standard dropout is not "closed under" simplex...
 
-
         ## compute relations
         # apply query/key projections for relation and reshape to split into different heads
         xq_rel, xk_rel = self.wq_rel(x), self.wk_rel(x) # shape: [bsz, seqlen, n_rels * rel_proj_dim]
@@ -376,11 +376,12 @@ class RelationalAttention(nn.Module):
         # transpose to put "heads"/"relations" in final dim
         relations = rearrange(relations, 'b nr i j -> b i j nr') # (bs, seqlen, seqlen, n_rels)
 
-        # apply relation projection to map relations to common dimension with symbols
-        # maps d_r-dimensional r(x_i, x_j) to n_heads-dim for each head
-        # Math: r(x_i, x_j) W_r^h
-        proj_relations = self.wr(relations) # (bs, seqlen, seqlen, n_heads*head_dim)
-        proj_relations = rearrange(proj_relations, 'b i j (nh hd) -> b i j nh hd', nh=self.n_heads) # (bs, seqlen, seqlen, n_heads, head_dim)
+        # NOTE: in a previous version of this implementation, the relations were mapped to head_dim-dimensional space with W_r^h
+        # *before* the attention operation. However, this requires manifesting a large (N * N * D)- dimensional tensor instead of
+        # an (N * N * R)-dimensional tensor (where R << D; R usually equals n_heads). This is a significant memory bottleneck.
+        # This caused the memory requirement to scale quadratically with the sequence length which was prohibitive
+        # Here, instead, we only manifest the (N * N * R)-dimensional tensor, compute attention over the relations to obtain an (N * H * R)-dimensional tensor,
+        # then project to the final (N * H * head_dim)-dimensional tensor. This is much more memory efficient.
 
         # compute disentangled relational cross attention
         if not self.use_relative_positional_symbols:
@@ -388,16 +389,35 @@ class RelationalAttention(nn.Module):
             # attn_scores: (bs, n_heads, seqlen, seqlen)
             # relations: (bs, seqlen, seqlen, n_heads, head_dim)
             # Math: A_i^h = \sum_j \alpha_{ij}^h (r(x_i, x_j) W_r^h + s_j W_s^h)
+
+            # attend to symbols for each head
             attended_symbols = torch.einsum('bhij,bjhd->bihd', attn_scores, sv) # (bs, seqlen, n_heads, head_dim)
-            attended_relations = torch.einsum('bhij,bijhd->bihd', attn_scores, proj_relations) # (bs, seqlen, n_heads, head_dim)
+
+            # attend to relations for each head
+            # Math: \sum_j \alpha_{ij}^h r(x_i, x_j)
+            attended_relations = torch.einsum('bhij,bijr->bihr', attn_scores, relations) # (bs, seqlen, n_heads, n_relations)
+
+            # project relations to common dimension with symbols (per-head)
+            # Math: W_r^h (attended_relations)
+            attended_relations = torch.einsum('bihr,hdr->bihd', attended_relations, self.wr) # (bs, seqlen, n_heads, head_dim)
+
             output = attended_symbols + attended_relations # (bs, seqlen, n_heads, head_dim)
         else:
             # sv: (seqlen, seqlen, n_heads, head_dim)
             # attn_scores: (bs, n_heads, seqlen, seqlen)
             # relations: (bs, seqlen, seqlen, n_heads, head_dim)
             # Math: A_i^h = \sum_j \alpha_{ij}^h (r(x_i, x_j) W_r^h + s_{j-i} W_s)
+
+            # attend to symbols for each head
             attended_symbols = torch.einsum('bhij,ijhd->bihd', attn_scores, sv) # (bs, seqlen, n_heads, head_dim)
-            attended_relations = torch.einsum('bhij,bijhd->bihd', attn_scores, proj_relations) # (bs, seqlen, n_heads, head_dim)
+
+            # Math: \sum_j \alpha_{ij}^h r(x_i, x_j)
+            attended_relations = torch.einsum('bhij,bijr->bihr', attn_scores, relations) # (bs, seqlen, n_heads, n_relations)
+
+            # project relations to common dimension with symbols (per-head)
+            # Math: W_r^h (attended_relations)
+            attended_relations = torch.einsum('bihr,hdr->bihd', attended_relations, self.wr) # (bs, seqlen, n_heads, head_dim)
+
             output = attended_symbols + attended_relations # (bs, seqlen, n_heads, head_dim)
 
         # concat heads
@@ -921,8 +941,8 @@ class DualAttnTransformerLM(nn.Module):
 
         if symbol_retrieval == 'symbolic_attention':
             symbol_retriever = SymbolicAttention(**symbol_retrieval_kwargs)
-        elif symbol_retrieval == 'rel_sym_attn':
-            symbol_retriever = RelationalSymbolicAttention(**symbol_retrieval_kwargs)
+        # elif symbol_retrieval == 'rel_sym_attn':
+            # symbol_retriever = RelationalSymbolicAttention(**symbol_retrieval_kwargs)
         elif symbol_retrieval == 'positional_symbols':
             symbol_retriever = PositionalSymbolRetriever(**symbol_retrieval_kwargs)
         elif symbol_retrieval == 'position_relative':
@@ -983,6 +1003,7 @@ class DualAttnTransformerLM(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+            # NOTE: wr in relational attention is Parameter not Linear. do we need to init it the same way? FIXME
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
