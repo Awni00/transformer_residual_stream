@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from hellaswag import render_example, iterate_examples, get_most_likely_row
 from fineweb.fineweb_dataloader import DataLoaderLite
 import tiktoken
+import gc
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -52,7 +53,11 @@ parser.add_argument('--eval_interval', type=int, default=250, help='Interval for
 parser.add_argument('--val_loss_steps', type=int, default=20, help='Number of steps for validation loss')
 parser.add_argument('--save_checkpoints', type=int, default=1, help='Whether to save checkpoints')
 parser.add_argument('--save_interval', type=int, default=5000, help='Interval for saving model')
-parser.add_argument('--gen_interval', type=int, default=250, help='Interval for generation')
+parser.add_argument('--generate_during_training', type=int, default=0, help='Whether to periodically generate samples during training')
+parser.add_argument('--gen_interval', type=int, default=2500, help='Interval for generation')
+parser.add_argument('--hellaswag_during_training', type=int, default=1, help='Whether to evaluate hellaswag benchmark')
+parser.add_argument('--hellaswag_interval', type=int, default=2500, help='Whether to evaluate hellaswag benchmark')
+parser.add_argument('--track_grad_norms', type=int, default=1, help='Whether to track grad norms during trainign')
 parser.add_argument('--max_steps', type=int, default=19073, help='Maximum number of steps') # TODO change to calculate dynamically as # of tokens?
 
 # Add arguments for cuda optimizations
@@ -68,6 +73,7 @@ parser.add_argument('--n_layers', type=int, default=12, help='Number of layers i
 parser.add_argument('--sa', type=int, default=6, help='Number of attention heads')
 parser.add_argument('--ra', type=int, default=6, help='Number of attention heads')
 parser.add_argument('--symbol_type', default='symbolic_attention', type=str, choices=('position_relative', 'symbolic_attention', 'NA'), help='type of symbols to use')
+parser.add_argument('--trainable_symbols', default=0, type=int, help='whether to make symbols trainable (only applies to symbolic_attention)')
 parser.add_argument('--symmetric_rels', default=0, type=int, help='whether to impose symmetric relations in RA')
 parser.add_argument('--dff', type=int, default=None, help='Dimensionality of the feed-forward layer')
 parser.add_argument('--activation', type=str, default='gelu', help='Activation function')
@@ -127,9 +133,15 @@ eval_interval = args.eval_interval
 save_interval = args.save_interval
 val_loss_steps = args.val_loss_steps
 gen_interval = args.gen_interval
+hellaswag_during_training = bool(args.hellaswag_during_training)
+hellaswag_interval = args.hellaswag_interval
+generate_during_training = bool(args.generate_during_training)
+track_grad_norms = bool(args.track_grad_norms)
 max_steps = args.max_steps
-training_config = dict(eval_interval=eval_interval, save_interval=save_interval, val_loss_steps=val_loss_steps, gen_interval=gen_interval, max_steps=max_steps)
-
+training_config = dict(max_steps=max_steps, eval_interval=eval_interval, save_interval=save_interval, val_loss_steps=val_loss_steps,
+    generate_during_training=generate_during_training, gen_interval=gen_interval,
+    hellaswag_during_training=hellaswag_during_training, hellaswag_interval=hellaswag_interval,
+    track_grad_norms=track_grad_norms)
 
 # CUDA optimizations
 use_compile = bool(args.compile)
@@ -145,7 +157,8 @@ dff = args.dff
 ra_type = 'relational_attention'
 symmetric_rels = bool(args.symmetric_rels) if args.symmetric_rels in (0,1) else None
 symbol_type = args.symbol_type
-sym_attn_n_symbols = args.max_block_size # only applicable for symbol_type=sym_attn
+trainable_symbols = bool(args.trainable_symbols)
+sym_attn_n_symbols = d_model # args.max_block_size # only applicable for symbol_type=sym_attn
 activation = args.activation
 dropout_rate = args.dropout_rate
 norm_first = bool(args.norm_first)
@@ -161,7 +174,7 @@ pos_enc_type = args.pos_enc_type
 ra_kwargs = dict()
 if symbol_type == 'symbolic_attention':
     # NOTE: n_heads, n_symbols fixed for now
-    symbol_retrieval_kwargs = dict(d_model=d_model, n_symbols=sym_attn_n_symbols, n_heads=4, trainable_symbols=True)
+    symbol_retrieval_kwargs = dict(d_model=d_model, n_symbols=sym_attn_n_symbols, n_heads=4, trainable_symbols=trainable_symbols)
 elif symbol_type == 'position_relative':
     symbol_retrieval_kwargs = dict(symbol_dim=d_model, max_rel_pos=max_seq_len)
     ra_kwargs['use_relative_positional_symbols'] = True # if using position-relative symbols, need to tell RA module
@@ -210,9 +223,9 @@ if ddp:
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+    master_process = (ddp_rank == 0) # master process will do logging, checkpointing etc.
 else:
-    # vanilla, non-DDP run
+    # non-DDP run
     ddp_rank = 0
     ddp_local_rank = 0
     ddp_world_size = 1
@@ -342,6 +355,7 @@ def save_checkpoint():
     }
     torch.save(checkpoint, checkpoint_path)
 
+# NOTE: hellaswag eval and sample generation currently use raw_model only
 def eval_hellaswag():
     num_correct_norm = 0
     num_total = 0
@@ -376,6 +390,12 @@ def eval_hellaswag():
         with open(log_file, "a") as f:
             f.write(f"step {step:5d} | HellaSwag acc {num_correct_norm}/{num_total}={acc_norm:.4f}\n")
 
+        if wandb_log:
+            try:
+                wandb.log({"hellaswag/acc": acc_norm}, step = step)
+            except Exception as e:
+                print(f"logging to wandb failed: {e}")
+
 def generate_samples():
     model.eval()
     num_return_sequences = 4 # TODO: make these configurable parameters
@@ -392,7 +412,7 @@ def generate_samples():
             with autocast_ctx_manager:
                 logits, loss = model(xgen) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
-            probs = F.softmax(logits, dim=-1)
+            probs = torch.nn.functional.softmax(logits, dim=-1)
             topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
             ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
             xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
@@ -458,11 +478,12 @@ for step in range(1, max_steps + 1):
                 try:
                     wandb.log({"loss/val": val_loss_accum.item()}, step = step)
 
-                    if step > 0:
+                    if step > 0 and track_grad_norms:
                         param_grad_norms = get_grad_norms(raw_model)
                         layer_grad_norms = get_layerwise_grad_norms(raw_model)
                         wandb.log({f'grad_norms/{pn}': gn for pn, gn in param_grad_norms.items()}, step = step)
                         wandb.log({f'layer_grad_norms/{ln}': gn for ln, gn in layer_grad_norms.items()}, step = step)
+                        del param_grad_norms, layer_grad_norms
                 except Exception as e:
                     print(f"logging to wandb failed: {e}")
 
@@ -470,11 +491,11 @@ for step in range(1, max_steps + 1):
                 save_checkpoint()
 
     # once in a while evaluate hellaswag
-    if (step % eval_interval == 0 or last_step) and (not use_compile): # TODO: fix hellaswag issue
+    if (step % eval_interval == 0 or last_step) and hellaswag_during_training:
         eval_hellaswag()
 
     # # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % eval_interval == 0) or last_step) and (not use_compile):
+    if ((step > 0 and step % eval_interval == 0) or last_step) and generate_during_training:
         generate_samples()
 
     # do one step of the optimization
@@ -499,7 +520,7 @@ for step in range(1, max_steps + 1):
 
     # clip gradients
     if grad_clip is not None:
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip) # TODO: log norms per layer
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip) # TODO: log norms per layer
 
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
@@ -521,7 +542,7 @@ for step in range(1, max_steps + 1):
     tokens_per_sec = tokens_processed / dt
     eta = (max_steps - step) * dt # estimated time until completion
     if master_process:
-        log_string = f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | progress: {percent_progress*100:.2f}% | elapsed: {format_time(elapsed_time)} | ETA: {format_time(eta)}"
+        log_string = f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {grad_norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | progress: {percent_progress*100:.2f}% | elapsed: {format_time(elapsed_time)} | ETA: {format_time(eta)}"
         print(log_string)
         with open(log_file, "a") as f:
             f.write(log_string + "\n")
@@ -534,13 +555,16 @@ for step in range(1, max_steps + 1):
                         "step": step,
                         "tokens": step * grad_accum_steps * ddp_world_size * micro_batch_size * max_seq_len,
                         "loss/train": loss_accum.item(),
-                        "norm": norm,
+                        "grad_norm": grad_norm,
                         "lr": lr,
+                        "tokens_per_sec": tokens_per_sec,
                         # "mfu": running_mfu * 100,  # convert to percentage
                     }, step = step
                 )
             except Exception as e:
                 print(f"logging to wandb failed: {e}")
+    del loss_accum, loss, logits, x, y
+    gc.collect()
 
 if ddp:
     destroy_process_group()
