@@ -72,6 +72,8 @@ parser.add_argument('--d_model', type=int, default=768, help='Dimensionality of 
 parser.add_argument('--n_layers', type=int, default=12, help='Number of layers in the model')
 parser.add_argument('--sa', type=int, default=6, help='Number of attention heads')
 parser.add_argument('--ra', type=int, default=6, help='Number of attention heads')
+parser.add_argument('--n_relations', type=int, default=None, help='Number of relations')
+parser.add_argument('--rel_activation', type=str, default='identity', help='Relation activation function')
 parser.add_argument('--symbol_type', default='symbolic_attention', type=str, choices=('position_relative', 'symbolic_attention', 'NA'), help='type of symbols to use')
 parser.add_argument('--trainable_symbols', default=0, type=int, help='whether to make symbols trainable (only applies to symbolic_attention)')
 parser.add_argument('--symmetric_rels', default=0, type=int, help='whether to impose symmetric relations in RA')
@@ -156,6 +158,9 @@ sa, ra = args.sa, args.ra
 dff = args.dff
 ra_type = 'relational_attention'
 symmetric_rels = bool(args.symmetric_rels) if args.symmetric_rels in (0,1) else None
+n_relations = args.n_relations
+rel_proj_dim = None if n_relations is None else int((d_model / (sa+ra)) * (ra / n_relations))
+rel_activation = args.rel_activation
 symbol_type = args.symbol_type
 trainable_symbols = bool(args.trainable_symbols)
 sym_attn_n_symbols = d_model # args.max_block_size # only applicable for symbol_type=sym_attn
@@ -171,7 +176,7 @@ pos_enc_type = args.pos_enc_type
 # gate_activation = args.gate_activation
 # gate_on = args.gate_on
 
-ra_kwargs = dict()
+ra_kwargs = dict(n_relations=n_relations, rel_activation=rel_activation, rel_proj_dim=rel_proj_dim)
 if symbol_type == 'symbolic_attention':
     # NOTE: n_heads, n_symbols fixed for now
     symbol_retrieval_kwargs = dict(d_model=d_model, n_symbols=sym_attn_n_symbols, n_heads=4, trainable_symbols=trainable_symbols)
@@ -375,6 +380,7 @@ def eval_hellaswag():
             pred_norm = get_most_likely_row(tokens, mask, logits)
         num_total += 1
         num_correct_norm += int(pred_norm == label)
+    del tokens, mask, label, logits
 
     # reduce the stats across all processes
     if ddp:
@@ -423,6 +429,8 @@ def generate_samples():
         tokens = xgen[i, :max_length].tolist()
         decoded = enc.decode(tokens)
         print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+    del xgen, logits, loss, probs, topk_probs, topk_indices, ix, xcol
 
 # utility function for getting the gradient norms
 
