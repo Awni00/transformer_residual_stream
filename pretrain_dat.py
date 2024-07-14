@@ -55,7 +55,7 @@ parser.add_argument('--save_checkpoints', type=int, default=1, help='Whether to 
 parser.add_argument('--save_interval', type=int, default=5000, help='Interval for saving model')
 parser.add_argument('--generate_during_training', type=int, default=0, help='Whether to periodically generate samples during training')
 parser.add_argument('--gen_interval', type=int, default=2500, help='Interval for generation')
-parser.add_argument('--hellaswag_during_training', type=int, default=1, help='Whether to evaluate hellaswag benchmark')
+parser.add_argument('--hellaswag_during_training', type=int, default=0, help='Whether to evaluate hellaswag benchmark')
 parser.add_argument('--hellaswag_interval', type=int, default=2500, help='Whether to evaluate hellaswag benchmark')
 parser.add_argument('--track_grad_norms', type=int, default=1, help='Whether to track grad norms during trainign')
 parser.add_argument('--max_steps', type=int, default=19073, help='Maximum number of steps') # TODO change to calculate dynamically as # of tokens?
@@ -86,12 +86,8 @@ parser.add_argument('--max_block_size', type=int, default=1024, help='Maximum bl
 parser.add_argument('--bias', type=int, default=0, help='Whether to include bias in the model')
 parser.add_argument('--pos_enc_type', type=str, default='RoPE', help='Type of positional encoding')
 
-# Add arguments for residual gate configuration
-# parser.add_argument('--gate_on', choices=('attn', 'ffn', 'attn-ffn', 'none'), default='none', help='Where to apply residual gate')
-# parser.add_argument('--gate_bias_init', type=float, default=3., help='initialization value for bias in residual gate')
-# parser.add_argument('--gate_application', type=str, default='none', help='Ways of applying gate')
-# parser.add_argument('--gate_compute', type=str, default='linear-bias', help='Ways of computing gates')
-# parser.add_argument('--gate_activation', type=str, default='sigmoid', help='Type of positional encoding')
+parser.add_argument('--resume', type=str, default=None, help='path to checkpoint to resume from')
+parser.add_argument('--wandb_fork_run_id', type=str, default=None, help='wandb run id to fork from')
 
 parser.add_argument('--seed', type=int, default=None, help='Random seed')
 
@@ -130,6 +126,8 @@ optimizer_config = dict(
     weight_decay=weight_decay, betas=betas, learning_rate=learning_rate, grad_clip=grad_clip)
 
 # Training procedure
+resume = args.resume
+wandb_fork_run_id = args.wandb_fork_run_id
 train_log_interval = args.train_log_interval
 eval_interval = args.eval_interval
 save_interval = args.save_interval
@@ -140,15 +138,16 @@ hellaswag_interval = args.hellaswag_interval
 generate_during_training = bool(args.generate_during_training)
 track_grad_norms = bool(args.track_grad_norms)
 max_steps = args.max_steps
-training_config = dict(max_steps=max_steps, eval_interval=eval_interval, save_interval=save_interval, val_loss_steps=val_loss_steps,
-    generate_during_training=generate_during_training, gen_interval=gen_interval,
-    hellaswag_during_training=hellaswag_during_training, hellaswag_interval=hellaswag_interval,
-    track_grad_norms=track_grad_norms)
 
 # CUDA optimizations
 use_compile = bool(args.compile)
 use_bf16 = bool(args.use_bf16)
 use_tf32_matmul = bool(args.use_tf32_matmul)
+
+training_config = dict(max_steps=max_steps, eval_interval=eval_interval, save_interval=save_interval, val_loss_steps=val_loss_steps,
+    generate_during_training=generate_during_training, gen_interval=gen_interval,
+    hellaswag_during_training=hellaswag_during_training, hellaswag_interval=hellaswag_interval,
+    track_grad_norms=track_grad_norms, use_compile=use_compile, use_bf16=use_bf16, use_tf32_matmul=use_tf32_matmul)
 
 # Model configuration
 vocab_size = args.vocab_size
@@ -208,8 +207,7 @@ else:
     # model = DualAttnTransformerLM(**model_args).to(device)
 
 run_config = dict(
-    optimizer_config=optimizer_config, training_config=training_config, use_compile=use_compile,
-    use_bf16=use_bf16, use_tf32_matmul=use_tf32_matmul, model_config=model_config)
+    optimizer_config=optimizer_config, training_config=training_config, model_config=model_config)
 
 # annotate run_name with datetime
 datetime_now = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
@@ -283,10 +281,27 @@ if use_tf32_matmul:
 autocast_ctx_manager = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if use_bf16 else nullcontext()
 
 # create model
-if ra == 0:
-    model = TransformerLM(**model_config)
-else:
+start_step = 0
+if resume is not None:
+    print('loading checkpoint and extracting model_config')
+    ckpt = torch.load(resume, map_location=device)
+    start_step = ckpt['step']
+    model_config = ckpt['config']
+    run_config = ckpt.get('run_config', None)
+
+print('building model')
+if 'n_heads_ra' in model_config:
     model = DualAttnTransformerLM(**model_config)
+else:
+    model = TransformerLM(**model_config)
+
+if resume is not None:
+    print('loading model weights from checkpoint')
+    state_dict = ckpt['model']
+    prefix_to_remove = '_orig_mod.'
+    model_state_dict = {k.replace(prefix_to_remove, ''): v for k, v in state_dict.items()}
+    model.load_state_dict(model_state_dict)
+
 model.to(device)
 torchinfo.summary(model)
 
@@ -313,11 +328,19 @@ def get_lr(it):
 
 # initialize wandb logging
 if wandb_log and master_process:
-    wandb.init(project=wandb_project, name=run_name, config=run_config)
+    if wandb_fork_run_id is None:
+        wandb.init(project=wandb_project, name=run_name, config=run_config)
+    else:
+        print('Forking from previous W&B run with ID:', wandb_fork_run_id)
+        wandb.init(project=wandb_project, fork_from=f'{wandb_fork_run_id}?_step={start_step}')
 
 # optimizer
 optimizer = configure_optimizers(raw_model, weight_decay=weight_decay, betas=betas,
     learning_rate=learning_rate, device_type=device_type)
+
+# load optimizer state from checkpoint if resuming
+if resume is not None:
+    optimizer.load_state_dict(ckpt['optimizer'])
 
 # create the log directory we will write checkpoints to and log to
 log_dir = f"log/{run_name}"
@@ -353,6 +376,7 @@ def save_checkpoint():
     checkpoint = {
         'model': raw_model.state_dict(),
         'config': model_config,
+        'run_config': run_config,
         'step': step,
         'val_loss': val_loss_accum.item(),
         'optimizer': optimizer.state_dict(),
@@ -360,7 +384,6 @@ def save_checkpoint():
     }
     torch.save(checkpoint, checkpoint_path)
 
-# NOTE: hellaswag eval and sample generation currently use raw_model only
 def eval_hellaswag():
     num_correct_norm = 0
     num_total = 0
@@ -376,7 +399,10 @@ def eval_hellaswag():
         # get the logits
         with torch.no_grad():
             with autocast_ctx_manager:
-                logits, loss = model(tokens)
+                # NOTE: using compiled model seems to work on a single-GPU with an A40
+                # but it gives a torchdynamo error with DDP and an A100/H100 (not sure why)
+                # logits, loss = model(tokens)
+                logits, loss = raw_model(tokens)
             pred_norm = get_most_likely_row(tokens, mask, logits)
         num_total += 1
         num_correct_norm += int(pred_norm == label)
@@ -406,7 +432,7 @@ def generate_samples():
     model.eval()
     num_return_sequences = 4 # TODO: make these configurable parameters
     max_length = 32
-    tokens = enc.encode("Hello, I'm a language model,") # TODO: make this a parameter
+    tokens = enc.encode("Hello, I'm a language model,") # TODO: make this more interesting
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
     xgen = tokens.to(device)
@@ -465,15 +491,38 @@ def format_time(seconds):
 if wandb_log and wandb_watch:
     wandb.watch(raw_model, log="all", log_freq=eval_interval*grad_accum_steps, log_graph=True) # log gradients, weights, biases, etc.
 
+# resume training if checkpoint is provided
+# step counter starts from last step and the train_loader is set to the correct position
+# NOTE: this assumes that total_batch_size is the same as was used in previous run
+if resume is not None:
+    if start_step > max_steps:
+        print(f"checkpoint step {start_step} is greater than max_steps {max_steps}, exiting")
+        exit()
+    if 'run_config' in ckpt:
+        total_batch_size_ = ckpt['run_config']['optimizer_config']['total_batch_size']
+        token_position = start_step * total_batch_size_
+        train_loader.set_current_position(token_position)
+        del total_batch_size_
+    else:
+        print("WARNING: could not find total_batch_size in checkpoint, assuming previous run used the same total_batch_size")
+        token_position = start_step * total_batch_size
+        train_loader.set_current_position(token_position)
+
+    print(f'RESUMING TRAINING FROM STEP {start_step}')
+    print(f'START POSITION IN `train_loader` is {train_loader.current_position:,}')
+    print(f"NOTE: THIS WAS CALCULATED BASED ON ckpt['step'] AND `total_batch_size`")
+    print()
+else:
+    start_step = 1
+
 start_time = time.time()
-for step in range(1, max_steps + 1):
+for step in range(start_step, max_steps + 1):
     t0 = time.time()
     last_step = (step == max_steps)
 
     # once in a while evaluate our validation loss
     if step % eval_interval == 0 or last_step:
         val_loss_accum = eval_val_loss()
-
 
         if master_process:
             # compute and log the gradient norms (currently only for the master process)
@@ -499,11 +548,11 @@ for step in range(1, max_steps + 1):
                 save_checkpoint()
 
     # once in a while evaluate hellaswag
-    if (step % eval_interval == 0 or last_step) and hellaswag_during_training:
+    if (step % hellaswag_interval == 0 or last_step) and hellaswag_during_training:
         eval_hellaswag()
 
     # # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % eval_interval == 0) or last_step) and generate_during_training:
+    if ((step > 0 and step % gen_interval == 0) or last_step) and generate_during_training:
         generate_samples()
 
     # do one step of the optimization
@@ -573,6 +622,9 @@ for step in range(1, max_steps + 1):
                 print(f"logging to wandb failed: {e}")
     del loss_accum, loss, logits, x, y
     gc.collect()
+
+if master_process:
+    wandb.finish()
 
 if ddp:
     destroy_process_group()
