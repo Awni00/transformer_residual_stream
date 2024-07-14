@@ -46,3 +46,21 @@ class DataLoaderLite:
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
         return x, y
+
+    def set_current_position(self, tokens):
+        print()
+        print('[process_rank: {self.process_rank}] CALCULATING CURRENT POSITION WITHIN DATALOADER')
+        # set current position according to process_rank (offset so that processes don't overlap)
+        tokens = tokens + self.B * self.T * self.process_rank
+        while True:
+            print(f'[process_rank: {self.process_rank}] At token position: {tokens:,} in shard: {self.current_shard}')
+            if tokens + (self.B * self.T * self.process_rank + 1) < len(self.tokens):
+                print(f'[process_rank: {self.process_rank}] Token position is within current shard (shard: {self.current_shard})')
+                print(f'[process_rank: {self.process_rank}] Setting current position: {tokens + self.B * self.T * self.process_rank:,}')
+                self.current_position = tokens
+                break
+            else:
+                print(f'[process_rank: {self.process_rank}] Do not fit (i.e., overflow) in current shard (shard: {self.current_shard}), moving to next shard')
+                tokens -= len(self.tokens)
+                self.current_shard = (self.current_shard + 1) % len(self.shards)
+                self.tokens = load_tokens(self.shards[self.current_shard])
