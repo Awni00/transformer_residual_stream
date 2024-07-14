@@ -152,6 +152,9 @@ class DualAttention(nn.Module):
 # Math: r(x_i, x_j) = (\langle x_i W_{q, \ell}^{rel}, x_j W_{k, \ell}^{rel}\rangle)_{\ell \in [d_r]}
 # Math: (s_1, ..., s_n) = \mathrm{SymbolRetriever}(x_1, ..., x_n)
 
+# TODO: add support for sharing single key-proj for all relations (similar to MQA)
+# TODO: should default rel_proj_dim be s.t. rel_proj_dim = head_dim * n_h^ra // n_relations? 
+# (so that param count is constant as n_relations varies)
 class RelationalAttention(nn.Module):
     def __init__(self,
             d_model: int,
@@ -226,19 +229,19 @@ class RelationalAttention(nn.Module):
         self.use_relative_positional_symbols = use_relative_positional_symbols # whether to use relative positional symbols
 
         self.total_n_heads = n_heads if total_n_heads is None else total_n_heads # total number of heads in abstract attention
-        self.key_dim = key_dim if key_dim is not None else self.d_model // self.total_n_heads # key dimension
-        self.rel_proj_dim = rel_proj_dim if rel_proj_dim is not None else self.key_dim # dimension of relation projections
-
-        self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
         self.head_dim = self.d_model // self.total_n_heads # dim of projections
+        self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
+        self.key_dim = key_dim if key_dim is not None else self.head_dim # key dimension
+        self.rel_proj_dim = rel_proj_dim if rel_proj_dim is not None else self.head_dim # dimension of relation projections
 
         # make relative size of parameters and dimensions makes sense
         assert self.n_heads % self.n_kv_heads == 0, f"n_heads={self.n_heads}, n_kv_heads = {self.n_kv_heads}"
         assert self.n_rep_kv * self.n_kv_heads == self.n_heads, f"n_rep_kv={self.n_rep_kv}, n_kv_heads={self.n_kv_heads}, n_heads={self.n_heads}"
         assert self.total_n_heads * self.head_dim == self.d_model, f"total_n_heads={self.total_n_heads}, head_dim={self.head_dim}, d_model={self.d_model}"
+        assert self.rel_proj_dim * self.n_relations == self.head_dim * self.n_heads, f"rel_proj_dim={self.rel_proj_dim}, n_relations={self.n_relations}, head_dim={self.head_dim}"
 
         self.attn_scale = 1 / math.sqrt(self.head_dim) # for scaled dot product attention
-        self.rel_scale = 1 / math.sqrt(self.rel_proj_dim)
+        self.rel_scale = 1 / math.sqrt(self.rel_proj_dim) # for relations
 
         # Wq, Wk projections for attention
         self.wq_attn = nn.Linear(self.d_model, self.n_heads * self.key_dim, bias=False)
@@ -1033,13 +1036,12 @@ class DualAttnTransformerLM(nn.Module):
 
         x = self.layers.norm(x)
 
+        logits = self.layers.final_out(x)
+
+        loss = None
         if targets is not None:
             # compute loss if given targets
-            logits = self.layers.final_out(x)
             loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.contiguous().view(-1), ignore_index=-1)
-        else:
-            logits = self.layers.final_out(x[:, [-1], :])
-            loss = None
 
         return logits, loss
 
