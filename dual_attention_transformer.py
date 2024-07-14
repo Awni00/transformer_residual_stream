@@ -574,7 +574,7 @@ class PositionRelativeSymbolRetriever(nn.Module):
 
     def forward(self, x):
         length = x.shape[1]
-        return self.rel_pos_enc(length)
+        return self.rel_pos_enc(length, device=x.device)
 
 class RelativePositionalEncoding(nn.Module):
 
@@ -598,7 +598,7 @@ class RelativePositionalEncoding(nn.Module):
         self.rel_pos_embeddings = nn.Parameter(torch.Tensor(max_rel_pos * 2 + 1, dim))
         nn.init.xavier_uniform_(self.rel_pos_embeddings)
 
-    def forward(self, length_q, length_k=None):
+    def forward(self, length_q, length_k=None, device=None):
         """
         Parameters
         ----------
@@ -616,8 +616,8 @@ class RelativePositionalEncoding(nn.Module):
         if length_k is None:
             length_k = length_q
 
-        range_q = torch.arange(length_q) # TODO: need to set dtype or device?
-        range_k = torch.arange(length_k)
+        range_q = torch.arange(length_q, device=device)
+        range_k = torch.arange(length_k, device=device)
 
         distance_mat = range_k[None, :] - range_q[:, None]
         distance_mat_clipped = torch.clamp(distance_mat, -self.max_relative_position, self.max_relative_position)
