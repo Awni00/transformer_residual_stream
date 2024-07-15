@@ -170,10 +170,6 @@ norm_type = args.norm_type
 max_block_size = args.max_block_size
 bias = bool(args.bias)
 pos_enc_type = args.pos_enc_type
-# gate_application = args.gate_application
-# gate_compute = args.gate_compute
-# gate_activation = args.gate_activation
-# gate_on = args.gate_on
 
 ra_kwargs = dict(n_relations=n_relations, rel_activation=rel_activation, rel_proj_dim=rel_proj_dim)
 if symbol_type == 'symbolic_attention':
@@ -264,7 +260,10 @@ grad_accum_steps = total_batch_size // (micro_batch_size * max_seq_len * ddp_wor
 run_config['training_config']['grad_accum_steps'] = grad_accum_steps
 
 if master_process:
-    print(f"total desired batch size: {total_batch_size}")
+    print(f"total batch size: {total_batch_size} tokens")
+    print(f'sequence length: {max_seq_len} tokens')
+    print(f'# of processes: {ddp_world_size}')
+    print(f'micro batch size: {micro_batch_size} batches')
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=micro_batch_size, T=max_seq_len, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
@@ -302,8 +301,23 @@ if resume is not None:
     model_state_dict = {k.replace(prefix_to_remove, ''): v for k, v in state_dict.items()}
     model.load_state_dict(model_state_dict)
 
-model.to(device)
-torchinfo.summary(model)
+model = model.to(device)
+model_summary = torchinfo.summary(model, input_data=torch.zeros((1, max_seq_len), device=device).int())
+if master_process:
+    print(model_summary)
+
+model_summary_dict = {
+    'Input size (MB)': model_summary.to_megabytes(model_summary.total_input),
+    'Params size (MB)': model_summary.to_megabytes(model_summary.total_param_bytes),
+    'Forward/backward pass size  (MB)': model_summary.to_megabytes(model_summary.total_output_bytes),
+    'Estimated total size (MB)': model_summary.to_megabytes(model_summary.total_output_bytes + model_summary.total_param_bytes + model_summary.total_input),
+    'Total Mult-Adds': model_summary.total_mult_adds,
+
+    'trainable_params': model_summary.trainable_params,
+    'total_params': model_summary.total_params,
+}
+
+run_config['model_summary'] = model_summary_dict
 
 # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
@@ -312,15 +326,14 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-# TODO: put this function in a separate file?
 def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
+    # stage 1: linear warmup for warmup_iters steps
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
+    # stage 3: if it > lr_decay_iters, return min learning rate
     if it > max_steps:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+    # stage 2: in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
@@ -487,13 +500,14 @@ def format_time(seconds):
 
 # endregion
 
-# TODO: do manually...
+# NOTE: W&B's implementation logs histogram of gradients for all parameters; probably too much for large models?
+# the track_grad_norms option is a simpler alternative I implemented that only logs the norm of the gradients per parameter
 if wandb_log and wandb_watch:
     wandb.watch(raw_model, log="all", log_freq=eval_interval*grad_accum_steps, log_graph=True) # log gradients, weights, biases, etc.
 
 # resume training if checkpoint is provided
 # step counter starts from last step and the train_loader is set to the correct position
-# NOTE: this assumes that total_batch_size is the same as was used in previous run
+# NOTE: this assumes that total_batch_size is the same as was used in previous run (if not in ckpt run_config)
 if resume is not None:
     if start_step > max_steps:
         print(f"checkpoint step {start_step} is greater than max_steps {max_steps}, exiting")
@@ -623,12 +637,10 @@ for step in range(start_step, max_steps + 1):
     del loss_accum, loss, logits, x, y
     gc.collect()
 
-if master_process:
+if wandb_log and master_process:
     wandb.finish()
 
 if ddp:
     destroy_process_group()
 
-# TODO: add 'resume' option
-# NOTE: is this loop better than llama2.c's training loop? or worse? or in-between?
 # TODO: incorporate missing features in llama2.c's training loop into this one
