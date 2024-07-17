@@ -72,10 +72,15 @@ parser.add_argument('--d_model', type=int, default=768, help='Dimensionality of 
 parser.add_argument('--n_layers', type=int, default=12, help='Number of layers in the model')
 parser.add_argument('--sa', type=int, default=6, help='Number of attention heads')
 parser.add_argument('--ra', type=int, default=6, help='Number of attention heads')
+parser.add_argument('--n_kv_heads', type=int, default=None, help='Number of key/value heads (e.g., MQA if 1)')
 parser.add_argument('--n_relations', type=int, default=None, help='Number of relations')
 parser.add_argument('--rel_activation', type=str, default='identity', help='Relation activation function')
 parser.add_argument('--symbol_type', default='symbolic_attention', type=str, choices=('position_relative', 'symbolic_attention', 'NA'), help='type of symbols to use')
 parser.add_argument('--trainable_symbols', default=0, type=int, help='whether to make symbols trainable (only applies to symbolic_attention)')
+parser.add_argument('--shared_symbol_retriever', default=1, type=int, help='Whether to use a shared symbol retriever for all layers')
+parser.add_argument('--weight_tie_symbol_library', default=0, type=int, help='whether to tie weights of symbol library if retriever not shared')
+parser.add_argument('--sym_attn_n_symbols', default=None, type=int, help='number of symbols to use in sym_attn')
+parser.add_argument('--sym_attn_n_heads', default=None, type=int, help='number of heads to use in sym_attn')
 parser.add_argument('--symmetric_rels', default=0, type=int, help='whether to impose symmetric relations in RA')
 parser.add_argument('--dff', type=int, default=None, help='Dimensionality of the feed-forward layer')
 parser.add_argument('--activation', type=str, default='gelu', help='Activation function')
@@ -162,7 +167,9 @@ rel_proj_dim = None if n_relations is None else int((d_model / (sa+ra)) * (ra / 
 rel_activation = args.rel_activation
 symbol_type = args.symbol_type
 trainable_symbols = bool(args.trainable_symbols)
-sym_attn_n_symbols = d_model # args.max_block_size # only applicable for symbol_type=sym_attn
+sym_attn_n_symbols = args.sym_attn_n_symbols if args.sym_attn_n_symbols is not None else d_model # only applicable for symbol_type=sym_attn
+sym_attn_n_heads = args.sym_attn_n_heads if args.sym_attn_n_heads is not None else 4 # only applicable for symbol_type=sym_attn
+symbol_retriever_config = dict(shared_symbol_retriever=bool(args.shared_symbol_retriever), weight_tie_symbol_library=bool(args.weight_tie_symbol_library))
 activation = args.activation
 dropout_rate = args.dropout_rate
 norm_first = bool(args.norm_first)
@@ -171,10 +178,11 @@ max_block_size = args.max_block_size
 bias = bool(args.bias)
 pos_enc_type = args.pos_enc_type
 
-ra_kwargs = dict(n_relations=n_relations, rel_activation=rel_activation, rel_proj_dim=rel_proj_dim)
+ra_kwargs = dict(n_relations=n_relations, rel_activation=rel_activation, rel_proj_dim=rel_proj_dim, n_kv_heads=args.n_kv_heads)
+sa_kwargs = dict(n_kv_heads=args.n_kv_heads)
 if symbol_type == 'symbolic_attention':
     # NOTE: n_heads, n_symbols fixed for now
-    symbol_retrieval_kwargs = dict(d_model=d_model, n_symbols=sym_attn_n_symbols, n_heads=4, trainable_symbols=trainable_symbols)
+    symbol_retrieval_kwargs = dict(d_model=d_model, n_symbols=sym_attn_n_symbols, n_heads=sym_attn_n_heads, trainable_symbols=trainable_symbols)
 elif symbol_type == 'position_relative':
     symbol_retrieval_kwargs = dict(symbol_dim=d_model, max_rel_pos=max_seq_len)
     ra_kwargs['use_relative_positional_symbols'] = True # if using position-relative symbols, need to tell RA module
@@ -196,7 +204,8 @@ if ra == 0:
 else:
     model_config = dict(
         vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads_sa=sa, n_heads_ra=ra, dff=dff,
-        ra_kwargs=ra_kwargs, ra_type=ra_type, symbol_retrieval=symbol_type, symbol_retrieval_kwargs=symbol_retrieval_kwargs,
+        sa_kwargs=sa_kwargs, ra_kwargs=ra_kwargs, ra_type=ra_type,
+        symbol_retrieval=symbol_type, symbol_retrieval_kwargs=symbol_retrieval_kwargs, symbol_retriever_config=symbol_retriever_config,
         pos_enc_type=pos_enc_type, activation=activation,
         dropout_rate=dropout_rate, norm_first=norm_first, max_block_size=max_seq_len, bias=bias)
 
@@ -303,8 +312,6 @@ if resume is not None:
 
 model = model.to(device)
 model_summary = torchinfo.summary(model, input_data=torch.zeros((1, max_seq_len), device=device).int())
-if master_process:
-    print(model_summary)
 
 model_summary_dict = {
     'Input size (MB)': model_summary.to_megabytes(model_summary.total_input),
@@ -313,9 +320,16 @@ model_summary_dict = {
     'Estimated total size (MB)': model_summary.to_megabytes(model_summary.total_output_bytes + model_summary.total_param_bytes + model_summary.total_input),
     'Total Mult-Adds': model_summary.total_mult_adds,
 
-    'trainable_params': model_summary.trainable_params,
-    'total_params': model_summary.total_params,
+    'trainable_params': model_summary.trainable_params, # note: numbers from torchinfo are not always accurate
+    'total_params': model_summary.total_params, # note: numbers from torchinfo are not always accurate
+
+    'num_params': sum(p.numel() for p in model.parameters()),
+    'num_trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad)
 }
+if master_process:
+    print(model_summary)
+    print(f'num params: {model_summary_dict["num_params"]:,}')
+    print(f'num trainable params: {model_summary_dict["num_trainable_params"]:,}')
 
 run_config['model_summary'] = model_summary_dict
 
