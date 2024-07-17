@@ -434,6 +434,11 @@ class RelationalAttention(nn.Module):
 
         return output, attn_scores, relations
 
+# NOTE: position-relative symbol variant is very memory hungry because it involves a large (N * N * D)-dimensional tensor
+# TODO: can we obtain a more memory-efficient implementation?
+# we don't really need N*N since there are only 2*N possible position-relative symbols (actually just N in causal case)
+# can we improve this?
+
 # region Symbol Assignment Mechanisms
 
 class SymbolicAttention(nn.Module):
@@ -879,6 +884,7 @@ class DualAttnTransformerLM(nn.Module):
             ra_kwargs: dict = None,
             ra_type: str = 'relational_attention',
             symbol_retrieval: str = 'symbolic_attention',
+            symbol_retriever_config: dict = None, # dict with keys: shared_symbol_retriever, weight_tie_symbol_library
             pos_enc_type: str = 'pos_emb',
             bias: bool = True):
         """
@@ -940,26 +946,47 @@ class DualAttnTransformerLM(nn.Module):
         self.pos_enc_type = pos_enc_type
         self.bias = bias
 
+        self.symbol_retriever_config = symbol_retriever_config if symbol_retriever_config is not None else {}
+        shared_symbol_retriever = self.symbol_retriever_config.setdefault('shared_symbol_retriever', True)
+        weight_tie_symbol_library = self.symbol_retriever_config.setdefault('weight_tie_symbol_library', False)
+
         self.n_heads = n_heads_sa + n_heads_ra
 
         if symbol_retrieval == 'symbolic_attention':
-            symbol_retriever = SymbolicAttention(**symbol_retrieval_kwargs)
+            if shared_symbol_retriever:
+                symbol_retrievers = [SymbolicAttention(**symbol_retrieval_kwargs)] * n_layers
+            else:
+                symbol_retrievers = [SymbolicAttention(**symbol_retrieval_kwargs) for _ in range(n_layers)]
         # elif symbol_retrieval == 'rel_sym_attn':
             # symbol_retriever = RelationalSymbolicAttention(**symbol_retrieval_kwargs)
         elif symbol_retrieval == 'positional_symbols':
-            symbol_retriever = PositionalSymbolRetriever(**symbol_retrieval_kwargs)
+            if shared_symbol_retriever:
+                symbol_retrievers = [PositionalSymbolRetriever(**symbol_retrieval_kwargs)] * n_layers
+            else:
+                symbol_retrievers = [PositionalSymbolRetriever(**symbol_retrieval_kwargs) for _ in range(n_layers)]
         elif symbol_retrieval == 'position_relative':
-            symbol_retriever = PositionRelativeSymbolRetriever(**symbol_retrieval_kwargs)
+            if shared_symbol_retriever:
+                symbol_retrievers = [PositionRelativeSymbolRetriever(**symbol_retrieval_kwargs)] * n_layers
+            else:
+                symbol_retrievers = [PositionRelativeSymbolRetriever(**symbol_retrieval_kwargs) for _ in range(n_layers)]
         else:
             raise ValueError(
                 f"`symbol_retrieval` must be one of 'symbolic_attention', 'rel_sym_attn', 'positional_symbols' or 'pos_relative."
                 f"received {symbol_retrieval}")
 
+        if not shared_symbol_retriever and weight_tie_symbol_library:
+            if symbol_retrieval == 'position_relative':
+                raise NotImplementedError('weight-tying not implemented for position-relative symbols')
+
+            # weight-tying symbol libraries across layers
+            for i in range(1, n_layers):
+                symbol_retrievers[i].symbol_library = symbol_retrievers[0].symbol_library
+        # TODO: add weight-tying for q_proj and/or template_features as well?
 
         layers = dict(
             token_embedder = nn.Embedding(vocab_size, d_model),
             dropout = nn.Dropout(dropout_rate),
-            symbol_retriever = symbol_retriever,
+            symbol_retrievers = nn.ModuleList(symbol_retrievers),
             blocks = nn.ModuleList([DualAttnEncoderBlock(
                 d_model=d_model, n_heads_sa=n_heads_sa, n_heads_ra=n_heads_ra, dff=dff, dropout_rate=dropout_rate,
                 activation=activation, norm_first=norm_first, norm_type=norm_type,
@@ -1030,8 +1057,8 @@ class DualAttnTransformerLM(nn.Module):
             freqs_cos = self.freqs_cos[:t]
             freqs_sin = self.freqs_sin[:t]
 
-        for block in self.layers.blocks:
-            symbols = self.layers.symbol_retriever(x)
+        for symbol_retriever, block in zip(self.layers.symbol_retrievers, self.layers.blocks):
+            symbols = symbol_retriever(x)
             x = block(x, symbols, freqs_cos=freqs_cos, freqs_sin=freqs_sin)
 
         x = self.layers.norm(x)
